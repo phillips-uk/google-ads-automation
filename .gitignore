@@ -1,0 +1,47 @@
+# ── Credentials & secrets — NEVER commit these ────────────────────────────────
+.env
+google-ads.yaml
+gtm_client.json
+gtm_token.json
+ga4_token.json
+merchant_token.json
+
+# ── Client config — contains real names and account IDs, never commit ─────────
+clients.py
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.Python
+venv/
+.venv/
+env/
+.env/
+pip-log.txt
+.pytest_cache/
+
+# ── Reports & logs — may contain client data ─────────────────────────────────
+reports/
+logs/
+
+# ── Assets not needed in public repo ─────────────────────────────────────────
+*.png
+*.jpg
+*.jpeg
+# Allow portfolio screenshots
+!screenshots/*.png
+
+# ── IDE & OS ──────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

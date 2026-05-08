@@ -1,0 +1,10 @@
+# Copy this to google-ads.yaml and fill in your values.
+# Get a developer token: https://developers.google.com/google-ads/api/docs/get-started/dev-token
+# Create OAuth credentials in Google Cloud Console (Desktop app type).
+
+developer_token: YOUR_DEVELOPER_TOKEN
+client_id: YOUR_CLIENT_ID
+client_secret: YOUR_CLIENT_SECRET
+refresh_token: YOUR_REFRESH_TOKEN
+login_customer_id: YOUR_MCC_CUSTOMER_ID  # 10-digit MCC ID, no dashes
+use_proto_plus: True
