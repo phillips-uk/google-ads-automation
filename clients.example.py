@@ -119,6 +119,41 @@ SEO_AUDIT_CLIENTS = {
     },
 }
 
+# ── analytics_report.py ───────────────────────────────────────────────────────
+# Combined GA4 Data + Search Console reporting for any property.
+#
+# ga4_property_id : GA4 property — "properties/XXXXXXXXX"
+# sc_site_url     : Search Console property — "sc-domain:example.com" (domain) or
+#                   "https://example.com/" (URL-prefix). Must match SC exactly.
+#                   Set to None if Search Console is not configured.
+# folder          : subfolder under OBSIDIAN_BASE (for client properties)
+# obsidian_path   : path relative to vault root, used for non-client properties
+#                   (e.g. personal portfolio, personal site). Use instead of folder.
+# monday_client   : post priority actions to Monday.com using this client name.
+#                   Set to None for properties not tracked in Monday.com.
+ANALYTICS_CLIENTS = {
+    "Client A": {
+        "ga4_property_id": "properties/000000000",
+        "sc_site_url":     None,   # add "sc-domain:yourclientdomain.com" when available
+        "folder":          "Client A",
+        "monday_client":   "Client A",
+    },
+    "Client B": {
+        "ga4_property_id": "properties/111111111",
+        "sc_site_url":     "sc-domain:yourclientdomain.com",
+        "folder":          "Client B",
+        "monday_client":   "Client B",
+    },
+    # Example: personal/portfolio property stored outside the clients folder
+    "My Portfolio": {
+        "ga4_property_id": "properties/000000000",
+        "sc_site_url":     "https://yourdomain.com/",   # URL-prefix SC property
+        "obsidian_path":   "My Brand/Portfolio",        # relative to vault root
+        "folder":          None,
+        "monday_client":   None,
+    },
+}
+
 # ── monday_helper.py ──────────────────────────────────────────────────────────
 # Your Monday.com board ID (visible in the board URL)
 MONDAY_BOARD_ID  = 0000000000

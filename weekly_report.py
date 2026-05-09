@@ -233,6 +233,50 @@ def main():
             except Exception as e:
                 print(f"    [WARN] Feed audit skipped: {e}")
 
+        # ── 6. Site analytics — GA4 Data + Search Console ────────────────────
+        print("    Running site analytics (GA4 + Search Console)...")
+        try:
+            from analytics_report import run_for_weekly, write_report as write_analytics_report
+            from clients import ANALYTICS_CLIENTS
+            if name in ANALYTICS_CLIENTS:
+                ga4_data, sc_data = run_for_weekly(name)
+                if ga4_data:
+                    # Write a standalone analytics note
+                    analytics_path = write_analytics_report(
+                        name, ANALYTICS_CLIENTS[name], ga4_data, sc_data,
+                        ai_text="— see dedicated analytics report —"
+                    )
+                    # Append a summary block to the weekly note
+                    cur = ga4_data["overview"]["current"]
+                    prv = ga4_data["overview"]["previous"]
+                    pct = (
+                        f"{(cur['sessions'] - prv['sessions']) / prv['sessions'] * 100:+.1f}%"
+                        if prv["sessions"] else "—"
+                    )
+                    sc_line = ""
+                    if sc_data:
+                        ct = sc_data[0]
+                        sc_line = (
+                            f"\n- SC: {ct['clicks']:,} clicks · "
+                            f"{ct['impressions']:,} impressions · "
+                            f"avg pos {ct['position']:.1f}"
+                        )
+                    summary_block = (
+                        f"\n\n---\n\n"
+                        f"## Site Analytics Summary\n\n"
+                        f"- GA4: {cur['sessions']:,} sessions ({pct} vs prior 28 days) · "
+                        f"{cur['users']:,} users · {cur['conversions']} conversions"
+                        f"{sc_line}\n\n"
+                        f"→ Full report: [[{os.path.basename(analytics_path).replace('.md', '')}]]\n"
+                    )
+                    with open(md_path, "a") as f:
+                        f.write(summary_block)
+                    print(f"    Analytics note: {analytics_path}")
+            else:
+                print(f"    ℹ️  {name} not in ANALYTICS_CLIENTS — skipping site analytics.")
+        except Exception as e:
+            print(f"    [WARN] Site analytics skipped: {e}")
+
     print("\n" + "=" * 70)
     print("Weekly report complete.")
 
