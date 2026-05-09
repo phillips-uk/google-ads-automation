@@ -72,7 +72,7 @@ PSI_API     = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
 
 TITLE_MIN      = 40
 TITLE_MAX      = 60
-META_MIN       = 100
+META_MIN       = 110
 META_MAX       = 160
 DESC_MIN_WORDS = 80
 
@@ -138,6 +138,14 @@ query ($cursor: String) {
 }
 """
 
+# ── IMPORTANT: This mutation writes ONLY to product.seo.title and
+# product.seo.description (the SEO meta fields). It never touches product.title
+# (the storefront product name) or product.body_html (the product description).
+#
+# CLIENT RULE — Lee Renee Jewellery (and any client with this flag):
+#   product.title and product.body_html changes require CLIENT APPROVAL before
+#   touching. Do not auto-apply. Surface as a separate recommendations report.
+#   Only product.seo.* fields may be applied directly via this script.
 _GQL_UPDATE_SEO = """
 mutation productSeoUpdate($input: ProductInput!) {
   productUpdate(input: $input) {
@@ -516,14 +524,19 @@ Be specific. No generic advice."""
 
 
 def _propose_titles(products: list, brand: str) -> dict:
+    """Generate SEO title proposals, batching 30 products per Claude call."""
     if not products:
         return {}
     claude = anthropic.Anthropic()
-    lines  = "\n".join(
-        f"- ID:{p['id']} | {p['title']}"
-        for p in products[:30]
-    )
-    prompt = f"""Write improved SEO title tags for {brand}, a fine jewellery brand.
+    proposals = {}
+    BATCH = 30
+    for batch_start in range(0, len(products), BATCH):
+        batch = products[batch_start:batch_start + BATCH]
+        lines = "\n".join(
+            f"- ID:{p['id']} | {p['title']}"
+            for p in batch
+        )
+        prompt = f"""Write improved SEO title tags for {brand}, a fine jewellery brand.
 
 Formula: [Material/Gemstone] [Style/Design] [Product Type] – {brand}
 Rules:
@@ -543,40 +556,46 @@ ID:[product_id] | [new title]
 Products:
 {lines}"""
 
-    msg = claude.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1200,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    proposals = {}
-    for line in msg.content[0].text.strip().split("\n"):
-        line = line.strip()
-        if line.startswith("ID:") and "|" in line:
-            raw_id, _, title = line.partition("|")
-            pid = raw_id.replace("ID:", "").strip()
-            proposals[pid] = title.strip()
+        msg = claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2400,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        for line in msg.content[0].text.strip().split("\n"):
+            line = line.strip()
+            if line.startswith("ID:") and "|" in line:
+                raw_id, _, title = line.partition("|")
+                pid = raw_id.replace("ID:", "").strip()
+                proposals[pid] = title.strip()
     return proposals
 
 
 def _propose_metas(products: list, client_name: str) -> dict:
+    """Generate meta description proposals, batching 30 products per Claude call."""
     if not products:
         return {}
     claude = anthropic.Anthropic()
-    lines  = "\n".join(
-        f"- ID:{p['id']} | {p['title']} ({p['words']} words in description)"
-        for p in products[:30]
-    )
-    prompt = f"""Write meta descriptions for {client_name}, a fine jewellery e-commerce brand.
+    proposals = {}
+    BATCH = 30
+    for batch_start in range(0, len(products), BATCH):
+        batch = products[batch_start:batch_start + BATCH]
+        lines = "\n".join(
+            f"- ID:{p['id']} | {p['title']} ({p['words']} words in description)"
+            for p in batch
+        )
+        prompt = f"""Write meta descriptions for {client_name}, a fine jewellery e-commerce brand.
 
 Rules:
-- 105–155 characters (mobile-optimised, count carefully)
+- MINIMUM 110 characters, maximum 155 characters — count every character carefully
+- Descriptions under 110 characters will be rejected and redone — do not write short ones
 - Match buyer intent: who searches for this? (gift-giver, self-purchaser)
 - Include: what it is + material + occasion or benefit + subtle CTA
 - No hollow phrases: "beautiful", "perfect gift", "stunning", "luxurious"
 - Specific and honest — only describe what the product is
 
-Good example (127 chars):
-"Handcrafted sterling silver freshwater pearl ring. Elegant for everyday wear or a thoughtful birthday gift. Free UK delivery."
+Good examples (110–155 chars):
+"Handcrafted sterling silver freshwater pearl ring. Elegant for everyday wear or a thoughtful birthday gift. Free UK delivery." (125 chars)
+"Sterling silver dahlia bud ring set with garnet. A delicate statement piece for any occasion. Gift-wrapped and shipped across the UK." (132 chars)
 
 For each product, respond with ONLY:
 ID:[product_id] | [meta description]
@@ -584,18 +603,17 @@ ID:[product_id] | [meta description]
 Products:
 {lines}"""
 
-    msg = claude.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=2000,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    proposals = {}
-    for line in msg.content[0].text.strip().split("\n"):
-        line = line.strip()
-        if line.startswith("ID:") and "|" in line:
-            raw_id, _, meta = line.partition("|")
-            pid = raw_id.replace("ID:", "").strip()
-            proposals[pid] = meta.strip()
+        msg = claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=4000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        for line in msg.content[0].text.strip().split("\n"):
+            line = line.strip()
+            if line.startswith("ID:") and "|" in line:
+                raw_id, _, meta = line.partition("|")
+                pid = raw_id.replace("ID:", "").strip()
+                proposals[pid] = meta.strip()
     return proposals
 
 
@@ -718,7 +736,7 @@ def write_report(client_name, folder, stats, product_issues, cwv,
             "| ID | Product | Current Title | Proposed Title | Action |",
             "| --- | --- | --- | --- | --- |",
         ]
-        for p in title_fixes[:40]:
+        for p in title_fixes:
             proposed = title_proposals.get(p["id"], "")
             if not proposed:
                 proposed = "_(edit me)_"
@@ -746,7 +764,7 @@ def write_report(client_name, folder, stats, product_issues, cwv,
             "| ID | Product | Current Meta | Proposed Meta | Action |",
             "| --- | --- | --- | --- | --- |",
         ]
-        for p in meta_fixes[:40]:
+        for p in meta_fixes:
             cur_meta = (p.get("seo_meta") or "_(none)_")[:70].replace("|", "\\|")
             proposed = meta_proposals.get(p["id"], "")
             if not proposed:
@@ -895,11 +913,12 @@ def apply_latest_report(client_name: str, cfg: dict, dry_run: bool = False):
             result = _shopify_gql(shop, token, _GQL_UPDATE_SEO, {
                 "input": {"id": gid, "seo": seo_input}
             })
-            errors = result.get("productUpdate", {}).get("userErrors", [])
+            update = result.get("data", {}).get("productUpdate", {})
+            errors = update.get("userErrors", [])
             if errors:
                 print(f"  ❌ {pid}: {errors}")
             else:
-                ptitle = result.get("productUpdate", {}).get("product", {}).get("title", pid)
+                ptitle = (update.get("product") or {}).get("title", pid)
                 print(f"  ✅ {ptitle}")
                 applied += 1
         except Exception as e:
@@ -1019,13 +1038,15 @@ def run_seo_audit(client_name: str = None, post_to_monday: bool = True):
             cwv[url] = get_cwv(url)
 
         # 5 — Proposals
-        print("\n  Generating title and meta proposals with Claude...")
         title_needs = [p for p in product_issues
                        if any(i[0] in ("title_short", "title_long", "title_dupe", "title_default")
-                              for i in p["issues"])][:30]
+                              for i in p["issues"])]
         meta_needs  = [p for p in product_issues
                        if any(i[0] in ("meta_missing", "meta_short")
-                              for i in p["issues"])][:30]
+                              for i in p["issues"])]
+        print(f"\n  Generating title and meta proposals with Claude "
+              f"({len(title_needs)} titles, {len(meta_needs)} metas, "
+              f"batching 30 per call)...")
         title_proposals = _propose_titles(title_needs, brand)
         meta_proposals  = _propose_metas(meta_needs, name)
         print(f"  Titles proposed: {len(title_proposals)}  |  Metas proposed: {len(meta_proposals)}")
