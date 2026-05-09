@@ -224,12 +224,27 @@ def check_robots(domain: str) -> dict:
         resp = requests.get(f"https://{domain}/robots.txt", timeout=10)
         content = resp.text if resp.ok else ""
         issues = []
+        # Parse block by block so we only flag Disallow rules that apply to
+        # Googlebot (or the wildcard *) — not rules scoped to other bots like
+        # AdsBot-Google, Nutch, AhrefsBot, etc.
+        current_agents = []
+        googlebot_agents = {"*", "googlebot"}
         for line in content.splitlines():
-            lower = line.strip().lower()
-            if lower.startswith("disallow:"):
-                path = lower.replace("disallow:", "").strip()
-                if path in ("/", "/products", "/products/", "/collections", "/collections/"):
-                    issues.append(f"Blocks `{path}`")
+            stripped = line.strip()
+            lower = stripped.lower()
+            if lower.startswith("user-agent:"):
+                agent = lower.replace("user-agent:", "").strip()
+                current_agents.append(agent)
+            elif stripped == "" or lower.startswith("#"):
+                # Blank line ends a User-agent block
+                if stripped == "":
+                    current_agents = []
+            elif lower.startswith("disallow:"):
+                # Only flag if the current block applies to Googlebot
+                if any(a in googlebot_agents for a in current_agents):
+                    path = lower.replace("disallow:", "").strip()
+                    if path in ("/", "/products", "/products/", "/collections", "/collections/"):
+                        issues.append(f"Blocks `{path}` for {current_agents}")
         return {"ok": resp.ok, "issues": issues, "snippet": content[:800]}
     except Exception as e:
         return {"ok": False, "issues": [f"Fetch failed: {e}"], "snippet": ""}
@@ -262,7 +277,7 @@ def check_https(domain: str) -> dict:
 
 # ── PageSpeed Insights ────────────────────────────────────────────────────────
 
-def get_cwv(url: str) -> dict | None:
+def get_cwv(url: str):
     try:
         resp = requests.get(PSI_API, params={"url": url, "strategy": "mobile"}, timeout=30)
         if not resp.ok:
