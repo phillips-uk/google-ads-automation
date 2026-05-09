@@ -97,6 +97,17 @@ MERCHANT_ID          = "000000000"
 MERCHANT_ACCOUNT     = "Client B"
 MERCHANT_FOLDER      = "Client B"
 
+# ── seo_search_console.py ─────────────────────────────────────────────────────
+# site_url must match the Search Console property exactly.
+# Domain properties use "sc-domain:yourdomain.com" format.
+# URL-prefix properties use "https://www.yourdomain.com/" format.
+SC_CLIENTS = {
+    "Client B": {
+        "site_url": "sc-domain:yourclientdomain.com",
+        "folder":   "Client B",
+    },
+}
+
 # ── monday_helper.py ──────────────────────────────────────────────────────────
 # Your Monday.com board ID (visible in the board URL)
 MONDAY_BOARD_ID  = 0000000000
