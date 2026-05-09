@@ -108,6 +108,17 @@ SC_CLIENTS = {
     },
 }
 
+# ── seo_audit.py ─────────────────────────────────────────────────────────────
+SEO_AUDIT_CLIENTS = {
+    "Client B": {
+        "shopify_shop":   "yourstore.myshopify.com",
+        "shopify_domain": "yourclientdomain.com",
+        "sc_site_url":    "sc-domain:yourclientdomain.com",
+        "folder":         "Client B",
+        "brand_name":     "Your Brand Name",
+    },
+}
+
 # ── monday_helper.py ──────────────────────────────────────────────────────────
 # Your Monday.com board ID (visible in the board URL)
 MONDAY_BOARD_ID  = 0000000000

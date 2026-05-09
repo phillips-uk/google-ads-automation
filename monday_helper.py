@@ -52,6 +52,19 @@ _TITLE_MAP = [
     ("excluded from 'conversions'",             ("Include conversion action in Smart Bidding",   0.5)),
     ("last click attribution",                  ("Update attribution model to Data-Driven",      0.5)),
     ("no consent settings configured",          ("Add consent settings to tracking tags",        0.5)),
+    # SEO / Search Console
+    ("sc quick win",                             ("Optimise content for SC quick-win query",       1.0)),
+    ("sc ctr fix",                               ("Rewrite title tag and meta description",        0.5)),
+    ("sc decline watch",                         ("Monitor declining SC queries",                  0.5)),
+    ("sc technical",                             ("Fix technical SEO issue",                       2.0)),
+    # SEO Audit
+    ("seo: orphan products",                     ("Add orphan products to collections",            1.0)),
+    ("seo: missing meta descriptions",           ("Write meta descriptions for products",          3.0)),
+    ("seo: duplicate seo titles",                ("Fix duplicate SEO titles",                      2.0)),
+    ("seo: thin descriptions",                   ("Expand thin product descriptions",              4.0)),
+    ("seo: missing alt text",                    ("Add alt text to product images",                2.0)),
+    ("robots.txt blocking",                      ("Fix robots.txt blocking critical paths",        0.5)),
+    ("poor pagespeed",                           ("Improve PageSpeed / Core Web Vitals",           4.0)),
 ]
 
 

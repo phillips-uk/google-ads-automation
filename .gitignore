@@ -5,6 +5,7 @@ gtm_client.json
 gtm_token.json
 ga4_token.json
 merchant_token.json
+sc_token.json
 
 # ── Client config — contains real names and account IDs, never commit ─────────
 clients.py
