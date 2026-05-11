@@ -40,7 +40,8 @@ except ImportError:
     print("         Copy clients.example.py → clients.py and set MERCHANT_ID, MERCHANT_ACCOUNT, MERCHANT_FOLDER.")
     import sys; sys.exit(1)
 
-TOKEN_FILE   = os.path.join(os.path.dirname(__file__), "merchant_token.json")
+from config import get_merchant_token_file
+TOKEN_FILE   = get_merchant_token_file(MERCHANT_ACCOUNT)  # resolves merchant_token_<slug>.json
 CLIENT_FILE  = os.path.join(os.path.dirname(__file__), "gtm_client.json")
 SCOPES       = ["https://www.googleapis.com/auth/content"]
 
