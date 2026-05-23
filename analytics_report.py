@@ -234,9 +234,17 @@ def _build_ga4_section(data):
         "| Event | Count | Counted as Conversion |",
         "| --- | --- | --- |",
     ]
+    total_conversions = sum(ev["conversions"] for ev in data["events"])
     for ev in data["events"]:
         conv_flag = "✓" if ev["conversions"] > 0 else "—"
         lines.append(f"| {ev['event']} | {ev['count']:,} | {conv_flag} |")
+
+    if total_conversions == 0:
+        lines += [
+            "",
+            "> ⚠️ **No conversion events recorded this period.** This may indicate a tracking issue.",
+            "> Fix guide: [How to Fix Google Ads Conversion Tracking](https://www.phillips-uk.com/guides/fix-google-ads-conversion-tracking/)",
+        ]
 
     lines += [
         "",
@@ -367,7 +375,17 @@ def write_report(client_name, cfg, ga4_data, sc_data, ai_text):
     ga4_section = _build_ga4_section(ga4_data)
     sc_section  = _build_sc_section(sc_data)
 
-    lines = header + ga4_section + ["", "---", ""] + sc_section
+    resources = [
+        "",
+        "---",
+        "",
+        "## Resources",
+        "",
+        "- [How to Fix Google Ads Conversion Tracking](https://www.phillips-uk.com/guides/fix-google-ads-conversion-tracking/) — Inactive actions, duplicate counting, primary/secondary setup, Enhanced Conversions, Consent Mode v2, April 2026 GA4 changes.",
+        "- [Free Google Ads Audit](https://www.phillips-uk.com/google-ads-audit) — Account-level audit covering conversion tracking, bidding, keywords, audiences and feed health.",
+    ]
+
+    lines = header + ga4_section + ["", "---", ""] + sc_section + resources
 
     with open(path, "w") as f:
         f.write("\n".join(lines))
