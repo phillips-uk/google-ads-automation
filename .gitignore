@@ -4,7 +4,10 @@ google-ads.yaml
 gtm_client.json
 gtm_token.json
 ga4_token.json
+ga4_data_sa.json
 merchant_token.json
+merchant_token_*.json
+merchant_center_sa.json
 sc_token.json
 
 # ── Client config — contains real names and account IDs, never commit ─────────

@@ -1,0 +1,89 @@
+<!--
+  GTM Custom HTML Tag: GA4 Session Context → Shopify Cart Attributes
+  ===================================================================
+  Fires on: All Pages (Consent Initialization — All Pages preferred,
+            or DOM Ready if GA4 config tag fires first)
+
+  What it does:
+    1. Reads GA4 client_id from the _ga cookie
+    2. Reads GA4 session_id from the _ga_BTVMM11L4Q cookie
+    3. Pushes both to dataLayer
+    4. Writes both as Shopify cart attributes via the AJAX Cart API
+
+  Why cart attributes?
+    Shopify Custom Pixels run in a sandboxed iframe — they cannot access
+    the main window's cookies, localStorage, or sessionStorage.
+    Cart attributes are the only reliable bridge: they survive the
+    checkout flow and are available in the checkout_completed event
+    as event.data.checkout.customAttributes.
+
+  Client: Lee Renée Jewellery — leereneejewellery.myshopify.com
+  Measurement ID: G-BTVMM11L4Q
+-->
+<script>
+(function () {
+  'use strict';
+
+  // ── 1. Read GA4 client_id from _ga cookie ──────────────────────────────────
+  // Cookie format: GA1.1.<client_id_part1>.<client_id_part2>
+  // client_id = "<part1>.<part2>"
+  var GA_COOKIE_RE = /_ga=GA[\d]+\.[\d]+\.([\d]+\.[\d]+)/;
+  var SESSION_COOKIE_RE = /_ga_BTVMM11L4Q=GS[\d]+\.[\d]+\.([\d]+)/;
+
+  var gaCookieMatch = document.cookie.match(GA_COOKIE_RE);
+  var sessionCookieMatch = document.cookie.match(SESSION_COOKIE_RE);
+
+  var clientId = gaCookieMatch ? gaCookieMatch[1] : null;
+  var sessionId = sessionCookieMatch ? sessionCookieMatch[1] : null;
+
+  if (!clientId) {
+    // GA4 cookie not yet set (very first page load) — nothing to do
+    return;
+  }
+
+  // ── 2. Push to dataLayer ───────────────────────────────────────────────────
+  window.dataLayer = window.dataLayer || [];
+  window.dataLayer.push({
+    'ga4_client_id': clientId,
+    'ga4_session_id': sessionId || ''
+  });
+
+  // ── 3. Write to Shopify cart attributes ───────────────────────────────────
+  // Uses the AJAX Cart API — works even on empty carts.
+  // Debounced to once per 30s to avoid hammering the endpoint on SPAs.
+  var STORAGE_KEY = '_ga4_cart_attr_ts';
+  var DEBOUNCE_MS = 30000;
+
+  try {
+    var lastRun = parseInt(sessionStorage.getItem(STORAGE_KEY) || '0', 10);
+    if (Date.now() - lastRun < DEBOUNCE_MS) {
+      return; // Already ran recently this session
+    }
+    sessionStorage.setItem(STORAGE_KEY, String(Date.now()));
+  } catch (e) {
+    // sessionStorage blocked (private browsing edge case) — continue anyway
+  }
+
+  var payload = {
+    attributes: {
+      '_ga4_client_id': clientId
+    }
+  };
+  if (sessionId) {
+    payload.attributes['_ga4_session_id'] = sessionId;
+  }
+
+  try {
+    fetch('/cart/update.js', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      credentials: 'same-origin'
+    }).catch(function () {
+      // Silently swallow — cart update is best-effort
+    });
+  } catch (e) {
+    // fetch not available (very old browser) — ignore
+  }
+})();
+</script>

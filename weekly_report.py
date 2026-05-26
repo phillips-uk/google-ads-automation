@@ -33,6 +33,7 @@ from deep_analysis import (
     get_day_of_week,
     get_ad_group_performance,
     generate_deep_dive,
+    get_pmax_intelligence_block,
     PMAX_CHANNEL_TYPE,
     SEARCH_CHANNEL_TYPE,
 )
@@ -211,9 +212,25 @@ def main():
         )
         print(f"    → {md_path}")
 
+        # ── 4b. PMax Intelligence ─────────────────────────────────────────────
+        if has_pmax:
+            print("    Running PMax intelligence analysis...")
+            try:
+                pmax_block = get_pmax_intelligence_block(
+                    client, cid, name,
+                    date_from=da_from, date_to=da_to,
+                    prev_from=prev_start.strftime("%Y-%m-%d"),
+                    prev_to=prev_end.strftime("%Y-%m-%d"),
+                )
+                with open(md_path, "a") as f:
+                    f.write(f"\n\n---\n\n{pmax_block}")
+                print("    PMax intelligence appended to weekly note.")
+            except Exception as e:
+                print(f"    [WARN] PMax intelligence failed: {e}")
+
         # ── Post to Monday.com ────────────────────────────────────────────────
         print("    Posting action items to Monday.com...")
-        post_weekly_actions(name, deep_dive_md, irrelevant_terms)
+        post_weekly_actions(name, deep_dive_md, irrelevant_terms, report_path=str(md_path))
 
         # ── 5. Feed audit (accounts with a Merchant Center ID) ────────────────
         if account_config.get("merchant_id"):
@@ -232,6 +249,69 @@ def main():
                 print(f"    Feed health appended to weekly note.")
             except Exception as e:
                 print(f"    [WARN] Feed audit skipped: {e}")
+
+        # ── 5b. Tracking gap check — GA4 sessions vs GAds daily spend ────────
+        print("    Checking for tracking gaps (GA4 sessions vs spend)...")
+        try:
+            from tracking_audit import fetch_daily_ga4_sessions, fetch_daily_ads_spend
+            ga4_prop = account_config.get("ga4_property_id")
+            if ga4_prop:
+                # Aggregate daily_rows (per-campaign) into per-day spend totals
+                ads_by_date: dict = {}
+                for row in daily_rows:
+                    d = row["date"]
+                    ads_by_date[d] = ads_by_date.get(d, 0.0) + row["cost"]
+
+                ga4_daily = fetch_daily_ga4_sessions(ga4_prop, days=14)
+
+                gap_days = []
+                for day, spend in sorted(ads_by_date.items()):
+                    if spend < 50:
+                        continue
+                    sessions = ga4_daily.get(day, 0)
+                    if sessions == 0:
+                        gap_days.append({"date": day, "spend": spend, "sessions": 0, "severity": "🔴 CRITICAL"})
+                    elif sessions < 10:
+                        gap_days.append({"date": day, "spend": spend, "sessions": sessions, "severity": "🟠 HIGH"})
+
+                if gap_days:
+                    print(f"    ⚠️  {len(gap_days)} tracking gap day(s) detected — prepending alert to weekly note.")
+                    gap_lines = [
+                        "",
+                        "---",
+                        "",
+                        "## ⚠️ Tracking Gap Alert",
+                        "",
+                        f"**{len(gap_days)} day(s) with Google Ads spend >£50 and low/zero GA4 sessions in the last 14 days.**",
+                        "This indicates the Google & YouTube app's GA4 connection may have dropped.",
+                        "Action: Shopify Admin → Google & YouTube → Connected services → Google Analytics tab — should show **Active**.",
+                        "",
+                        "| Date | Severity | GAds Spend | GA4 Sessions |",
+                        "|---|---|---|---|",
+                    ]
+                    for g in gap_days:
+                        gap_lines.append(f"| {g['date']} | {g['severity']} | £{g['spend']:.2f} | {g['sessions']} |")
+                    gap_lines += [""]
+                    gap_block = "\n".join(gap_lines)
+
+                    # Prepend to the weekly note so it appears at the top of findings
+                    with open(md_path, "r") as f:
+                        existing = f.read()
+                    # Insert after the first --- (front matter end) if present, else prepend
+                    insert_marker = "\n---\n\n"
+                    pos = existing.find(insert_marker, existing.find("---") + 3)
+                    if pos != -1:
+                        updated = existing[: pos + len(insert_marker)] + gap_block + existing[pos + len(insert_marker):]
+                    else:
+                        updated = gap_block + existing
+                    with open(md_path, "w") as f:
+                        f.write(updated)
+                else:
+                    print("    Tracking continuity: OK — no blackout days in last 14 days.")
+            else:
+                print(f"    ℹ️  {name} has no ga4_property_id in AUDIT_ACCOUNTS — skipping gap check.")
+        except Exception as e:
+            print(f"    [WARN] Tracking gap check failed: {e}")
 
         # ── 6. Site analytics — GA4 Data + Search Console ────────────────────
         print("    Running site analytics (GA4 + Search Console)...")
@@ -276,6 +356,18 @@ def main():
                 print(f"    ℹ️  {name} not in ANALYTICS_CLIENTS — skipping site analytics.")
         except Exception as e:
             print(f"    [WARN] Site analytics skipped: {e}")
+
+        # ── 7. Search Console weekly audit ───────────────────────────────────
+        print("    Running Search Console weekly audit...")
+        try:
+            from seo_search_console import run_sc_report
+            from clients import SC_CLIENTS
+            if name in SC_CLIENTS:
+                run_sc_report(client_name=name, post_to_monday=True)
+            else:
+                print(f"    ℹ️  {name} not in SC_CLIENTS — skipping Search Console.")
+        except Exception as e:
+            print(f"    [WARN] Search Console weekly skipped: {e}")
 
     print("\n" + "=" * 70)
     print("Weekly report complete.")

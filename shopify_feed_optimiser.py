@@ -73,54 +73,203 @@ _TYPE_KEYWORDS = [
 # Products that should be excluded from the feed rather than typed
 _EXCLUDE_FROM_FEED = {"gift card", "ring sizer", "ring sizer gauge"}
 
+# ── Attribute inference ────────────────────────────────────────────────────────
+
+# Material keyword patterns (most-specific first)
+_MATERIAL_PATTERNS = [
+    (r"gold vermeil",                     "Gold Vermeil"),
+    (r"rose gold",                        "Rose Gold"),
+    (r"18ct gold|18 carat gold|18k gold", "18ct Gold"),
+    (r"9ct gold|9 carat gold|9k gold",    "9ct Gold"),
+    (r"sterling silver",                  "Sterling Silver"),
+    (r"\bgold\b",                         "Gold"),
+    (r"\bsilver\b",                       "Sterling Silver"),
+    (r"platinum",                         "Platinum"),
+    (r"titanium",                         "Titanium"),
+    (r"copper",                           "Copper"),
+    (r"bronze",                           "Bronze"),
+]
+
+# Material → dominant colour for Shopping feed
+_MATERIAL_COLOR = {
+    "Gold Vermeil":    "Gold",
+    "Rose Gold":       "Rose Gold",
+    "18ct Gold":       "Gold",
+    "9ct Gold":        "Gold",
+    "Gold":            "Gold",
+    "Sterling Silver": "Silver",
+    "Platinum":        "Silver",
+    "Titanium":        "Grey",
+    "Copper":          "Copper",
+    "Bronze":          "Bronze",
+}
+
+# Gemstone/stone keywords → override colour (checked first)
+_GEMSTONE_COLORS = [
+    ("ruby",       "Red"),
+    ("garnet",     "Red"),
+    ("carnelian",  "Red"),
+    ("coral",      "Pink"),
+    ("sapphire",   "Blue"),
+    ("aquamarine", "Blue"),
+    ("turquoise",  "Blue"),
+    ("topaz",      "Blue"),
+    ("emerald",    "Green"),
+    ("peridot",    "Green"),
+    ("jade",       "Green"),
+    ("malachite",  "Green"),
+    ("amethyst",   "Purple"),
+    ("lavender",   "Purple"),
+    ("citrine",    "Yellow"),
+    ("amber",      "Amber"),
+    ("pearl",      "White"),
+    ("moonstone",  "White"),
+    ("diamond",    "White"),
+    ("onyx",       "Black"),
+    ("jet",        "Black"),
+    ("obsidian",   "Black"),
+    ("opal",       "Multi"),
+]
+
+# product_type → Google Product Category (full taxonomy path)
+_GPC_MAP = {
+    "Rings":     "Apparel & Accessories > Jewelry > Rings",
+    "Necklaces": "Apparel & Accessories > Jewelry > Necklaces",
+    "Earrings":  "Apparel & Accessories > Jewelry > Earrings",
+    "Bracelets": "Apparel & Accessories > Jewelry > Bracelets",
+    "Bangles":   "Apparel & Accessories > Jewelry > Bracelets",
+    "Brooches":  "Apparel & Accessories > Jewelry > Brooches & Lapel Pins",
+    "Anklets":   "Apparel & Accessories > Jewelry > Anklets",
+    "Charms":    "Apparel & Accessories > Jewelry > Charms & Pendants",
+    "Cufflinks": "Apparel & Accessories > Jewelry > Cuff Links",
+    "Tie Pins":  "Apparel & Accessories > Jewelry > Cuff Links",
+}
+
+_METAFIELD_NS = "custom"  # Shopify namespace for enrichment metafields
+
 
 # ── Shopify API ────────────────────────────────────────────────────────────────
 
-def _headers():
-    token = os.environ.get("SHOPIFY_ACCESS_TOKEN")
+# ── IMPORTANT — title ownership rule ──────────────────────────────────────────
+# This script proposes and applies changes ONLY to product.seo.title (the SEO
+# meta title). It never touches product.title (the storefront display name),
+# which requires client approval before any change.
+# The SEO title feeds directly into Simprosys as the Shopping feed title when
+# Simprosys is configured to use "SEO / HTTP title" as the feed title source.
+# ──────────────────────────────────────────────────────────────────────────────
+
+_GQL_FETCH_PRODUCTS = """
+query fetchProducts($cursor: String) {
+  products(first: 250, after: $cursor, query: "status:active") {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id
+        title
+        productType
+        tags
+        descriptionHtml
+        seo { title }
+        variants(first: 10) {
+          edges { node { price } }
+        }
+        metafields(first: 10, namespace: "custom") {
+          edges { node { key value } }
+        }
+      }
+    }
+  }
+}
+"""
+
+_GQL_UPDATE_SEO_TITLE = """
+mutation productSeoUpdate($input: ProductInput!) {
+  productUpdate(input: $input) {
+    product { id title seo { title } }
+    userErrors { field message }
+  }
+}
+"""
+
+_GQL_UPDATE_PRODUCT_TYPE = """
+mutation setProductType($input: ProductInput!) {
+  productUpdate(input: $input) {
+    product { id productType }
+    userErrors { field message }
+  }
+}
+"""
+
+_GQL_UPDATE_METAFIELDS = """
+mutation setMetafields($metafields: [MetafieldsSetInput!]!) {
+  metafieldsSet(metafields: $metafields) {
+    metafields { key value namespace }
+    userErrors { field message }
+  }
+}
+"""
+
+
+def _gql(query, variables=None):
+    """Execute a Shopify GraphQL query."""
+    token = os.environ.get("SHOPIFY_ACCESS_TOKEN_LEE_RENEE") or os.environ.get("SHOPIFY_ACCESS_TOKEN")
     if not token:
-        print("ERROR: SHOPIFY_ACCESS_TOKEN not set. Run shopify_oauth.py first.")
+        print("ERROR: SHOPIFY_ACCESS_TOKEN_LEE_RENEE not set.")
         sys.exit(1)
-    return {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
+    resp = requests.post(
+        f"https://{SHOP}/admin/api/{API_VER}/graphql.json",
+        headers={"X-Shopify-Access-Token": token, "Content-Type": "application/json"},
+        json={"query": query, "variables": variables or {}},
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    if "errors" in body:
+        raise RuntimeError(f"Shopify GQL error: {body['errors']}")
+    return body["data"]
 
 
 def fetch_all_products():
-    """Cursor-paginate through all active products."""
+    """Cursor-paginate through all active products via GraphQL. Includes seo.title."""
     products = []
-    url    = f"{BASE_URL}/products.json"
-    params = {
-        "limit":  250,
-        "status": "active",
-        "fields": "id,title,vendor,product_type,body_html,variants,tags",
-    }
-    headers = _headers()
+    cursor   = None
 
-    while url:
-        resp = requests.get(url, params=params, headers=headers)
-        resp.raise_for_status()
-        batch = resp.json().get("products", [])
-        products.extend(batch)
-        link     = resp.headers.get("Link", "")
-        next_url = None
-        for part in link.split(","):
-            if 'rel="next"' in part:
-                next_url = re.search(r"<([^>]+)>", part).group(1)
-        url    = next_url
-        params = {}
-        if next_url:
-            time.sleep(0.4)
+    while True:
+        data  = _gql(_GQL_FETCH_PRODUCTS, {"cursor": cursor})
+        page  = data["products"]
+        for edge in page["edges"]:
+            node = edge["node"]
+            # Extract existing custom metafields (material, color, google_product_category)
+            mf_edges = (node.get("metafields") or {}).get("edges", [])
+            custom_mf = {e["node"]["key"]: e["node"]["value"] for e in mf_edges}
+            # Normalise to a flat dict matching the shape the rest of the script expects
+            products.append({
+                "id":           int(node["id"].split("/")[-1]),
+                "gid":          node["id"],
+                "title":        node["title"],
+                "product_type": node["productType"],
+                "tags":         ", ".join(node["tags"]) if isinstance(node["tags"], list) else (node.get("tags") or ""),
+                "body_html":    node.get("descriptionHtml", ""),
+                "seo_title":    (node.get("seo") or {}).get("title") or "",
+                "metafields":   custom_mf,
+                "variants":     [
+                    {"price": v["node"]["price"]}
+                    for v in node["variants"]["edges"]
+                ],
+            })
+        if not page["pageInfo"]["hasNextPage"]:
+            break
+        cursor = page["pageInfo"]["endCursor"]
+        time.sleep(0.3)
 
     return products
 
 
-def _update_product(product_id, payload):
-    resp = requests.put(
-        f"{BASE_URL}/products/{product_id}.json",
-        headers=_headers(),
-        json={"product": payload},
-    )
-    resp.raise_for_status()
-    return resp.json().get("product")
+def _update_product_type(gid, product_type):
+    """Update product_type via GraphQL (replaces broken REST _update_product)."""
+    result = _gql(_GQL_UPDATE_PRODUCT_TYPE, {"input": {"id": gid, "productType": product_type}})
+    errs = (result.get("productUpdate") or {}).get("userErrors", [])
+    if errs:
+        raise RuntimeError(errs[0]["message"])
 
 
 # ── Analysis ───────────────────────────────────────────────────────────────────
@@ -170,11 +319,42 @@ def _infer_product_type(title):
     return None, False
 
 
+def _infer_material(title):
+    """Return inferred material string from title keywords, or None."""
+    lower = title.lower()
+    for pattern, material in _MATERIAL_PATTERNS:
+        if re.search(pattern, lower):
+            return material
+    return None
+
+
+def _infer_color(title, material=None):
+    """
+    Return inferred colour string.
+    Checks gemstone keywords first (override), then falls back to material colour.
+    """
+    lower = title.lower()
+    for keyword, color in _GEMSTONE_COLORS:
+        if keyword in lower:
+            return color
+    if material:
+        return _MATERIAL_COLOR.get(material)
+    return None
+
+
+def _infer_gpc(product_type):
+    """Return Google Product Category path string for a product_type, or None."""
+    if not product_type:
+        return None
+    return _GPC_MAP.get(product_type.strip())
+
+
 def audit_products(products):
-    zero_price   = []
-    missing_type = []
-    thin_desc    = []
-    weak_titles  = []
+    zero_price          = []
+    missing_type        = []
+    thin_desc           = []
+    weak_titles         = []
+    missing_attributes  = []
 
     for p in products:
         for v in p.get("variants", []):
@@ -191,16 +371,26 @@ def audit_products(products):
         if len(plain) < THIN_DESC_CHARS:
             thin_desc.append({"product": p, "desc_len": len(plain)})
 
-        score = _title_score(p["title"])
+        # Score against seo_title if one exists; fall back to product title.
+        # We only propose changes to seo_title — never product.title.
+        feed_title = p.get("seo_title") or p["title"]
+        score = _title_score(feed_title)
         if score < WEAK_TITLE_SCORE:
             weak_titles.append({"product": p, "score": score})
 
+        # Count products missing at least one enrichment metafield
+        mf = p.get("metafields", {})
+        excluded = any(e in p["title"].lower() for e in _EXCLUDE_FROM_FEED)
+        if not excluded and not (mf.get("material") and mf.get("color") and mf.get("google_product_category")):
+            missing_attributes.append(p)
+
     weak_titles.sort(key=lambda x: x["score"])
     return {
-        "zero_price":   zero_price,
-        "missing_type": missing_type,
-        "thin_desc":    thin_desc,
-        "weak_titles":  weak_titles,
+        "zero_price":         zero_price,
+        "missing_type":       missing_type,
+        "thin_desc":          thin_desc,
+        "weak_titles":        weak_titles,
+        "missing_attributes": missing_attributes,
     }
 
 
@@ -214,7 +404,8 @@ def _ai_propose_titles(batch):
     client = anthropic.Anthropic()
 
     items = "\n".join(
-        f"{i+1}. ID={p['id']} | {p['title']!r}"
+        f"{i+1}. ID={p['id']} | product_title={p['title']!r}"
+        + (f" | current_seo_title={p['seo_title']!r}" if p.get("seo_title") else " | seo_title=(none)")
         + (f" | type={p['product_type']!r}" if p.get("product_type") else "")
         + (f" | tags={p['tags']!r}" if p.get("tags") else "")
         for i, p in enumerate(batch)
@@ -300,16 +491,20 @@ def propose_changes(products, audit):
 
         product_map = {p["id"]: p for p in candidates}
         for imp in improvements:
-            pid   = imp["id"]
-            title = product_map.get(pid, {}).get("title", "?")
+            pid     = imp["id"]
+            product = product_map.get(pid, {})
+            title   = product.get("title", "?")
+            # Show current SEO title in the report (falls back to product title if none set)
+            current_seo = product.get("seo_title") or title
             # Auto-skip products that should be excluded from feed
             action = "skip" if any(e in title.lower() for e in _EXCLUDE_FROM_FEED) else "approve"
             title_proposals.append({
-                "product_id": pid,
-                "current":    title,
-                "proposed":   imp["new_title"],
-                "reason":     imp.get("reason", ""),
-                "action":     action,
+                "product_id":  pid,
+                "gid":         product.get("gid", f"gid://shopify/Product/{pid}"),
+                "current":     current_seo,
+                "proposed":    imp["new_title"],
+                "reason":      imp.get("reason", ""),
+                "action":      action,
             })
 
     # --- product_type proposals ---
@@ -341,12 +536,58 @@ def propose_changes(products, audit):
                 "note":          "could not infer — set manually",
             })
 
-    return title_proposals, type_proposals
+    # --- Attribute proposals (material, color, google_product_category) ---
+    attr_proposals = propose_attributes(products)
+
+    return title_proposals, type_proposals, attr_proposals
+
+
+def propose_attributes(products):
+    """
+    Infer material, color, google_product_category for products that are missing
+    any of these custom metafields. Returns a list of proposal dicts.
+    """
+    proposals = []
+    for p in products:
+        if any(e in p["title"].lower() for e in _EXCLUDE_FROM_FEED):
+            continue
+        existing_mf = p.get("metafields", {})
+
+        has_material = bool(existing_mf.get("material"))
+        has_color    = bool(existing_mf.get("color"))
+        has_gpc      = bool(existing_mf.get("google_product_category"))
+
+        if has_material and has_color and has_gpc:
+            continue  # already fully enriched
+
+        material = existing_mf.get("material") or _infer_material(p["title"])
+        color    = existing_mf.get("color") or _infer_color(p["title"], material)
+        gpc      = existing_mf.get("google_product_category") or _infer_gpc(p.get("product_type"))
+
+        # Skip rows where nothing can be inferred at all
+        if not (material or color or gpc):
+            continue
+
+        proposals.append({
+            "product_id":  p["id"],
+            "gid":         p["gid"],
+            "title":       p["title"],
+            "material":    material or "",
+            "color":       color or "",
+            "gpc":         gpc or "",
+            "action":      "approve",
+            # Track which are already set (so apply can skip those)
+            "has_material": has_material,
+            "has_color":    has_color,
+            "has_gpc":      has_gpc,
+        })
+
+    return proposals
 
 
 # ── Report writing ─────────────────────────────────────────────────────────────
 
-def write_report(products, audit, title_proposals=None, type_proposals=None, applied_changes=None):
+def write_report(products, audit, title_proposals=None, type_proposals=None, attr_proposals=None, applied_changes=None):
     os.makedirs(REPORT_DIR, exist_ok=True)
     today = date.today().isoformat()
     path  = os.path.join(REPORT_DIR, f"feed_optimisation_{today}.md")
@@ -363,7 +604,7 @@ def write_report(products, audit, title_proposals=None, type_proposals=None, app
         "",
     ]
 
-    if title_proposals is not None or type_proposals is not None:
+    if title_proposals is not None or type_proposals is not None or attr_proposals is not None:
         lines += [
             "> **How to review:** Change `approve` → `skip` to skip any change.",
             "> Edit the _Proposed_ column to adjust a suggestion.",
@@ -380,6 +621,7 @@ def write_report(products, audit, title_proposals=None, type_proposals=None, app
         f"| Missing product_type | {len(audit['missing_type'])} | Feed misclassification |",
         f"| Thin descriptions (<{THIN_DESC_CHARS} chars) | {len(audit['thin_desc'])} | Lower quality score |",
         f"| Weak Shopping titles | {len(audit['weak_titles'])} | Reduced impression share |",
+        f"| Missing attributes (material/color/GPC) | {len(audit['missing_attributes'])} | Lower ranking signals |",
         "",
     ]
 
@@ -387,9 +629,11 @@ def write_report(products, audit, title_proposals=None, type_proposals=None, app
     if title_proposals:
         approve_count = sum(1 for t in title_proposals if t["action"] == "approve")
         lines += [
-            f"## Title Improvements ({approve_count} to apply, {len(title_proposals)} total)",
+            f"## SEO Title Improvements ({approve_count} to apply, {len(title_proposals)} total)",
             "",
-            "| Product ID | Current Title | Proposed Title | Action |",
+            "> Changes apply to **product.seo.title** only — storefront product name is unchanged.",
+            "",
+            "| Product ID | Current SEO Title | Proposed SEO Title | Action |",
             "| --- | --- | --- | --- |",
         ]
         for tp in title_proposals:
@@ -410,6 +654,25 @@ def write_report(products, audit, title_proposals=None, type_proposals=None, app
         for tp in type_proposals:
             lines.append(
                 f"| {tp['product_id']} | {tp['title']} | {tp['suggested_type']} | {tp['action']} | {tp['note']} |"
+            )
+        lines.append("")
+
+    # Attribute enrichment proposals
+    if attr_proposals:
+        approve_count = sum(1 for a in attr_proposals if a["action"] == "approve")
+        lines += [
+            f"## Attribute Enrichment ({approve_count} to apply, {len(attr_proposals)} total)",
+            "",
+            "> Writes `custom.material`, `custom.color`, `custom.google_product_category` as Shopify metafields.",
+            "> After applying, map these in Simprosys: **Feed Settings → Custom Attributes** → Metafield mapping.",
+            "> Cells already set are shown as-is and will not be overwritten on apply.",
+            "",
+            "| Product ID | Product | Material | Color | Google Product Category | Action |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ]
+        for a in attr_proposals:
+            lines.append(
+                f"| {a['product_id']} | {a['title']} | {a['material']} | {a['color']} | {a['gpc']} | {a['action']} |"
             )
         lines.append("")
 
@@ -460,14 +723,15 @@ def write_report(products, audit, title_proposals=None, type_proposals=None, app
 
     # Applied changes log
     if applied_changes:
-        title_applied = [c for c in applied_changes if c["type"] == "title"]
+        title_applied = [c for c in applied_changes if c["type"] == "seo_title"]
         type_applied  = [c for c in applied_changes if c["type"] == "product_type"]
+        attr_applied  = [c for c in applied_changes if c["type"] == "attributes"]
 
         if title_applied:
             lines += [
-                f"## Title Changes Applied ({len(title_applied)})",
+                f"## SEO Title Changes Applied ({len(title_applied)})",
                 "",
-                "| Before | After |",
+                "| Before (seo.title) | After (seo.title) |",
                 "| --- | --- |",
             ]
             for c in title_applied:
@@ -483,6 +747,17 @@ def write_report(products, audit, title_proposals=None, type_proposals=None, app
             ]
             for c in type_applied:
                 lines.append(f"| {c['title']} | {c['value']} |")
+            lines.append("")
+
+        if attr_applied:
+            lines += [
+                f"## Attribute Metafields Applied ({len(attr_applied)})",
+                "",
+                "| Product | Material | Color | Google Product Category |",
+                "| --- | --- | --- | --- |",
+            ]
+            for c in attr_applied:
+                lines.append(f"| {c['title']} | {c['material']} | {c['color']} | {c['gpc']} |")
             lines.append("")
 
     if audit["thin_desc"]:
@@ -562,12 +837,12 @@ def apply_approved_changes(report_path=None, dry_run=False):
 
     changes = []
 
-    # --- Title changes ---
-    title_rows = _parse_table(content, "Current Title")
+    # --- SEO title changes (writes to product.seo.title — never product.title) ---
+    title_rows = _parse_table(content, "Current SEO Title")
     approved_titles = [r for r in title_rows if len(r) >= 4 and r[3].lower() == "approve"]
 
     if approved_titles:
-        print(f"\n  Title changes to apply: {len(approved_titles)}")
+        print(f"\n  SEO title changes to apply: {len(approved_titles)}")
         for row in approved_titles:
             pid, current, proposed = row[0], row[1], row[2]
             try:
@@ -575,19 +850,25 @@ def apply_approved_changes(report_path=None, dry_run=False):
             except ValueError:
                 print(f"  ⚠️  Skipping invalid product ID: {pid!r}")
                 continue
+            gid = f"gid://shopify/Product/{pid_int}"
             tag = "[DRY RUN] " if dry_run else ""
-            print(f"  {tag}{current!r} → {proposed!r}")
+            print(f"  {tag}seo.title: {current!r} → {proposed!r}")
             if not dry_run:
-                _update_product(pid_int, {"title": proposed})
+                result = _gql(_GQL_UPDATE_SEO_TITLE, {
+                    "input": {"id": gid, "seo": {"title": proposed}}
+                })
+                errs = (result.get("productUpdate") or {}).get("userErrors", [])
+                if errs:
+                    print(f"  ⚠️  {errs[0]['message']}")
                 time.sleep(0.3)
             changes.append({
-                "type":       "title",
+                "type":       "seo_title",
                 "product_id": pid_int,
                 "before":     current,
                 "after":      proposed,
             })
     else:
-        print("  No approved title changes found.")
+        print("  No approved SEO title changes found.")
 
     # --- product_type changes ---
     type_rows = _parse_table(content, "Suggested Type")
@@ -604,10 +885,14 @@ def apply_approved_changes(report_path=None, dry_run=False):
             except ValueError:
                 print(f"  ⚠️  Skipping invalid product ID: {pid!r}")
                 continue
+            gid = f"gid://shopify/Product/{pid_int}"
             tag = "[DRY RUN] " if dry_run else ""
             print(f"  {tag}{title!r} → product_type={suggested!r}")
             if not dry_run:
-                _update_product(pid_int, {"product_type": suggested})
+                try:
+                    _update_product_type(gid, suggested)
+                except RuntimeError as e:
+                    print(f"  ⚠️  {e}")
                 time.sleep(0.3)
             changes.append({
                 "type":       "product_type",
@@ -617,6 +902,51 @@ def apply_approved_changes(report_path=None, dry_run=False):
             })
     else:
         print("  No approved product_type changes found.")
+
+    # --- Attribute metafield changes (material / color / google_product_category) ---
+    attr_rows = _parse_table(content, "Google Product Category")
+    approved_attrs = [r for r in attr_rows if len(r) >= 6 and r[5].lower() == "approve"]
+
+    if approved_attrs:
+        print(f"\n  Attribute metafield changes to apply: {len(approved_attrs)}")
+        for row in approved_attrs:
+            pid, title, material, color, gpc = row[0], row[1], row[2], row[3], row[4]
+            try:
+                pid_int = int(pid)
+            except ValueError:
+                print(f"  ⚠️  Skipping invalid product ID: {pid!r}")
+                continue
+            gid = f"gid://shopify/Product/{pid_int}"
+            tag = "[DRY RUN] " if dry_run else ""
+            gpc_short = gpc[:40]
+            print(f"  {tag}{title!r}: material={material!r} color={color!r} gpc={gpc_short!r}")
+            if not dry_run:
+                mf_inputs = []
+                for key, value in [("material", material), ("color", color), ("google_product_category", gpc)]:
+                    if value:
+                        mf_inputs.append({
+                            "ownerId":   gid,
+                            "namespace": _METAFIELD_NS,
+                            "key":       key,
+                            "value":     value,
+                            "type":      "single_line_text_field",
+                        })
+                if mf_inputs:
+                    result = _gql(_GQL_UPDATE_METAFIELDS, {"metafields": mf_inputs})
+                    errs = (result.get("metafieldsSet") or {}).get("userErrors", [])
+                    if errs:
+                        print(f"  ⚠️  {errs[0]['message']}")
+                time.sleep(0.3)
+            changes.append({
+                "type":       "attributes",
+                "product_id": pid_int,
+                "title":      title,
+                "material":   material,
+                "color":      color,
+                "gpc":        gpc,
+            })
+    else:
+        print("  No approved attribute changes found.")
 
     return changes
 
@@ -664,13 +994,16 @@ def run_feed_optimiser(propose=False, apply=False, dry_run=False):
 
     title_proposals = None
     type_proposals  = None
+    attr_proposals  = None
 
     if propose:
         print()
-        title_proposals, type_proposals = propose_changes(products, audit)
+        title_proposals, type_proposals, attr_proposals = propose_changes(products, audit)
+        if attr_proposals:
+            print(f"  Attribute proposals generated: {len(attr_proposals)}")
 
     print("\n  Writing Obsidian report...")
-    report_path = write_report(products, audit, title_proposals, type_proposals)
+    report_path = write_report(products, audit, title_proposals, type_proposals, attr_proposals)
     print(f"  ✅ {report_path}")
 
     if propose:
@@ -682,6 +1015,7 @@ def run_feed_optimiser(propose=False, apply=False, dry_run=False):
         "audit":            audit,
         "title_proposals":  title_proposals,
         "type_proposals":   type_proposals,
+        "attr_proposals":   attr_proposals,
         "report_path":      report_path,
     }
 

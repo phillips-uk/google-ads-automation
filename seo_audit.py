@@ -184,17 +184,34 @@ def fetch_all_products(shop: str, token: str) -> list:
 # ── Search Console ────────────────────────────────────────────────────────────
 
 def get_sc_service():
-    creds = None
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SC_SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_FILE, SC_SCOPES)
-            creds = flow.run_local_server(port=0)
+    """Build Search Console service using OAuth (sc_token.json).
+
+    Search Console UI and API do not accept service account emails as users.
+    OAuth token (webmasters.readonly) is used instead. Token auto-refreshes.
+    """
+    import json as _json
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+
+    with open(TOKEN_FILE) as f:
+        token_data = _json.load(f)
+    with open(CLIENT_FILE) as f:
+        client_raw = _json.load(f)
+    client = client_raw.get("installed") or client_raw.get("web") or client_raw
+
+    creds = Credentials(
+        token=token_data.get("token"),
+        refresh_token=token_data["refresh_token"],
+        client_id=client["client_id"],
+        client_secret=client["client_secret"],
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=SC_SCOPES,
+    )
+    if not creds.valid:
+        creds.refresh(Request())
+        token_data["token"] = creds.token
         with open(TOKEN_FILE, "w") as f:
-            f.write(creds.to_json())
+            _json.dump(token_data, f, indent=2)
     return build("webmasters", "v3", credentials=creds)
 
 
@@ -846,7 +863,7 @@ def write_report(client_name, folder, stats, product_issues, cwv,
 def apply_latest_report(client_name: str, cfg: dict, dry_run: bool = False):
     folder    = cfg["folder"]
     shop      = cfg["shopify_shop"]
-    token     = os.environ.get("SHOPIFY_ACCESS_TOKEN", "")
+    token     = os.environ.get(cfg.get("shopify_token_env", "SHOPIFY_ACCESS_TOKEN"), "")
     report_dir = os.path.join(OBSIDIAN_BASE, folder, "SEO Audits")
 
     reports = sorted(
@@ -985,7 +1002,7 @@ def run_seo_audit(client_name: str = None, post_to_monday: bool = True):
         sc_url = cfg.get("sc_site_url")
         folder = cfg["folder"]
         brand  = cfg.get("brand_name", name.split()[0])
-        token  = os.environ.get("SHOPIFY_ACCESS_TOKEN", "")
+        token  = os.environ.get(cfg.get("shopify_token_env", "SHOPIFY_ACCESS_TOKEN"), "")
 
         print("\n" + "=" * 65)
         print(f"  SEO Audit — {name}")

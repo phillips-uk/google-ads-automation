@@ -25,9 +25,6 @@ import sys
 import argparse
 from datetime import date, timedelta
 
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
@@ -45,10 +42,7 @@ except ImportError:
     print("         Add SC_CLIENTS to your clients.py. See clients.example.py.")
     sys.exit(1)
 
-_DIR        = os.path.dirname(__file__)
-TOKEN_FILE  = os.path.join(_DIR, "sc_token.json")
-CLIENT_FILE = os.path.join(_DIR, "gtm_client.json")
-SCOPES      = ["https://www.googleapis.com/auth/webmasters.readonly"]
+_DIR = os.path.dirname(__file__)
 
 # Expected CTR benchmarks by rounded position (rough industry averages for informational/commercial)
 _CTR_BENCH = {1: 0.28, 2: 0.15, 3: 0.10, 4: 0.07, 5: 0.05,
@@ -59,20 +53,40 @@ def _expected_ctr(position):
     return _CTR_BENCH.get(max(1, min(10, round(position))), 0.01)
 
 
-# ── Auth ──────────────────────────────────────────────────────────────────────
+# ── Auth — OAuth (sc_token.json) ──────────────────────────────────────────────
+# Search Console UI and API do not accept service account emails as users.
+# OAuth token (webmasters.readonly) is retained. Auto-refreshes on use.
+
+_SC_TOKEN_FILE  = os.path.join(_DIR, "sc_token.json")
+_SC_CLIENT_FILE = os.path.join(_DIR, "gtm_client.json")  # same OAuth client
+_SC_SCOPES      = ["https://www.googleapis.com/auth/webmasters.readonly"]
+
 
 def get_sc_service():
-    creds = None
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open(TOKEN_FILE, "w") as f:
-            f.write(creds.to_json())
+    """Build Search Console service using OAuth (sc_token.json). Auto-refreshes."""
+    import json as _json
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+
+    with open(_SC_TOKEN_FILE) as f:
+        token_data = _json.load(f)
+    with open(_SC_CLIENT_FILE) as f:
+        client_raw = _json.load(f)
+    client = client_raw.get("installed") or client_raw.get("web") or client_raw
+
+    creds = Credentials(
+        token=token_data.get("token"),
+        refresh_token=token_data["refresh_token"],
+        client_id=client["client_id"],
+        client_secret=client["client_secret"],
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=_SC_SCOPES,
+    )
+    if not creds.valid:
+        creds.refresh(Request())
+        token_data["token"] = creds.token
+        with open(_SC_TOKEN_FILE, "w") as f:
+            _json.dump(token_data, f, indent=2)
     return build("webmasters", "v3", credentials=creds)
 
 

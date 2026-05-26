@@ -86,9 +86,11 @@ _EXCLUDE_FROM_FEED = {"gift card", "ring sizer", "ring sizer gauge"}
 # ── Shopify API ────────────────────────────────────────────────────────────────
 
 def _shopify_headers():
-    token = os.environ.get("SHOPIFY_ACCESS_TOKEN")
+    # Try client-specific token first (SHOPIFY_ACCESS_TOKEN_LEE_RENEE),
+    # then fall back to generic SHOPIFY_ACCESS_TOKEN for backwards compat.
+    token = os.environ.get("SHOPIFY_ACCESS_TOKEN_LEE_RENEE") or os.environ.get("SHOPIFY_ACCESS_TOKEN")
     if not token:
-        print("ERROR: SHOPIFY_ACCESS_TOKEN not set. Run shopify_oauth.py first.")
+        print("ERROR: SHOPIFY_ACCESS_TOKEN_LEE_RENEE not set. Add it to .env.")
         sys.exit(1)
     return {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
 
@@ -597,11 +599,11 @@ def run_feed_health(propose=True, audit_only=False, apply=False, dry_run=False, 
     Main entry point for the unified feed health check.
 
     Args:
-        propose:        generate AI proposals in the report (default True)
-        audit_only:     skip proposals, audit only
-        apply:          apply approved changes from latest report
-        dry_run:        show changes without writing
-        post_to_monday: post actionable MC issues to Monday.com
+        propose:           generate AI proposals in the report (default True)
+        audit_only:        skip proposals, audit only
+        apply:             apply approved changes from latest report
+        dry_run:           show changes without writing
+        post_to_monday: post actionable MC issues to Monday.com (Shopify group)
     """
     sep = "=" * 65
     print(f"\n{sep}")
@@ -681,7 +683,8 @@ def run_feed_health(propose=True, audit_only=False, apply=False, dry_run=False, 
         if monday_issues:
             print(f"\n  Posting {len(monday_issues)} issue(s) to Monday.com...")
             try:
-                post_audit_issues(MC_ACCOUNT, monday_issues)
+                post_audit_issues(MC_ACCOUNT, monday_issues, platform="Shopify",
+                                  report_path=str(report_path))
             except Exception as exc:
                 print(f"  ⚠️  Monday.com post failed: {exc}")
 

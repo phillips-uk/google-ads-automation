@@ -8,8 +8,10 @@ What this script does:
   4. Uses Claude to analyse patterns and generate prioritised recommendations
   5. Writes a dated Markdown report to Obsidian
 
-First run opens a browser for OAuth. Token cached in merchant_token.json.
-Same OAuth client as GTM (gtm_client.json) — scope: auth/content.
+Auth: service account key file (merchant_center_sa.json).
+No browser required, no token expiry.
+Service account: merchant-center-automation@groovy-sentry-494808-n2.iam.gserviceaccount.com
+Must be added as a Standard user in Merchant Center Admin → Users.
 
 Usage:
   python3 merchant_feed_audit.py
@@ -20,9 +22,7 @@ import json
 from datetime import date
 from collections import defaultdict
 
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
+from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
@@ -40,10 +40,13 @@ except ImportError:
     print("         Copy clients.example.py → clients.py and set MERCHANT_ID, MERCHANT_ACCOUNT, MERCHANT_FOLDER.")
     import sys; sys.exit(1)
 
-from config import get_merchant_token_file
-TOKEN_FILE   = get_merchant_token_file(MERCHANT_ACCOUNT)  # resolves merchant_token_<slug>.json
-CLIENT_FILE  = os.path.join(os.path.dirname(__file__), "gtm_client.json")
-SCOPES       = ["https://www.googleapis.com/auth/content"]
+# ── Service account key file ──────────────────────────────────────────────────
+# Non-expiring alternative to OAuth refresh token.
+# Key file: merchant_center_sa.json (gitignored, never committed).
+# To regenerate: GCP Console → Ads-Reporting-Automation → IAM → Service accounts
+#   → merchant-center-automation → Keys → Add key → JSON
+SA_KEY_FILE = os.path.join(os.path.dirname(__file__), "merchant_center_sa.json")
+SCOPES      = ["https://www.googleapis.com/auth/content"]
 
 REPORT_DIR = os.path.join(
     OBSIDIAN_BASE, ACCOUNT_FOLDER_NAME, "Feed Audits"
@@ -53,17 +56,14 @@ REPORT_DIR = os.path.join(
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
 def get_content_service():
-    creds = None
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open(TOKEN_FILE, "w") as f:
-            f.write(creds.to_json())
+    if not os.path.exists(SA_KEY_FILE):
+        print(f"[auth] ERROR: Service account key not found at {SA_KEY_FILE}")
+        print("       Download from GCP Console → Ads-Reporting-Automation → IAM → Service accounts")
+        print("       → merchant-center-automation → Keys → Add key → JSON")
+        import sys; sys.exit(1)
+    creds = service_account.Credentials.from_service_account_file(
+        SA_KEY_FILE, scopes=SCOPES
+    )
     return build("content", "v2.1", credentials=creds)
 
 
@@ -348,17 +348,17 @@ def feed_health_md_block(approved, limited, disapproved, pending, issue_summarie
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def run_feed_audit(post_to_monday=False):
+def run_feed_audit(post_to_monday=True, post_to_reminders=False):
     """
     Run the full feed audit.
 
     Args:
         post_to_monday: if True, post actionable issues to Monday.com
-                        (deduplication handled — existing items get due date bumped).
+                        (Shopify group on the Lee Renée Jewellery board).
 
     Returns:
         dict with keys: report_path, approved, limited, disapproved, pending,
-                        issue_summaries, ai_text, monday_issues
+                        issue_summaries, ai_text
     """
     print("\n" + "=" * 65)
     print(f"  Merchant Feed Audit — {ACCOUNT_NAME}")
@@ -398,10 +398,10 @@ def run_feed_audit(post_to_monday=False):
     print(f"  ✅ Report written: {report_path}")
 
     monday_issues = issues_for_monday(issue_summaries)
-
     if post_to_monday and monday_issues:
         print(f"\n  Posting {len(monday_issues)} feed issue(s) to Monday.com...")
-        post_audit_issues(ACCOUNT_NAME, monday_issues)
+        post_audit_issues(ACCOUNT_NAME, monday_issues, platform="Shopify",
+                          report_path=str(report_path))
 
     print("\n" + "=" * 65 + "\n")
     return {
@@ -412,7 +412,6 @@ def run_feed_audit(post_to_monday=False):
         "pending":        pending,
         "issue_summaries": issue_summaries,
         "ai_text":        ai_text,
-        "monday_issues":  monday_issues,
     }
 
 

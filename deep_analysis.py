@@ -221,6 +221,7 @@ def get_pmax_assets(client, customer_id):
             asset.image_asset.full_size.url
         FROM asset_group_asset
         WHERE asset_group.status = 'ENABLED'
+          AND campaign.status = 'ENABLED'
     """, "pmax_assets")
 
     groups = defaultdict(lambda: defaultdict(list))
@@ -239,6 +240,422 @@ def get_pmax_assets(client, customer_id):
         }
         for grp, fields in groups.items()
     }
+
+
+def get_pmax_asset_performance(client, customer_id):
+    """Returns PMax asset text grouped by asset group and field type.
+    Note: asset_group_asset.performance_label was removed in Google Ads API v17.
+    Labels are returned as 'N/A' — use asset group level metrics for performance signals."""
+
+    rows = _search(client, customer_id, """
+        SELECT
+          asset_group.name,
+          asset_group_asset.field_type,
+          asset.text_asset.text,
+          asset.name,
+          asset.type
+        FROM asset_group_asset
+        WHERE asset_group.status = 'ENABLED'
+          AND campaign.status = 'ENABLED'
+    """, "pmax_asset_performance")
+
+    groups = defaultdict(lambda: defaultdict(list))
+    for r in rows:
+        field_int = r.asset_group_asset.field_type
+        field_name = ASSET_FIELD_NAMES.get(field_int, f"field_{field_int}")
+        label = "N/A"
+        text = r.asset.text_asset.text or r.asset.name or ""
+        groups[r.asset_group.name][field_name].append({"text": text, "label": label})
+
+    return {grp: dict(fields) for grp, fields in groups.items()}
+
+
+def get_pmax_asset_group_metrics(client, customer_id, date_from, date_to, prev_from, prev_to):
+    """Returns asset group performance for current and previous period with WoW spend change."""
+
+    def _fetch_period(from_date, to_date):
+        rows = _search(client, customer_id, f"""
+            SELECT
+              asset_group.id, asset_group.name, asset_group.status,
+              metrics.impressions, metrics.clicks, metrics.cost_micros,
+              metrics.conversions, metrics.conversions_value, metrics.ctr
+            FROM asset_group
+            WHERE asset_group.status = 'ENABLED'
+              AND campaign.status = 'ENABLED'
+              AND segments.date BETWEEN '{from_date}' AND '{to_date}'
+        """, f"pmax_ag_metrics_{from_date}")
+        agg = {}
+        for r in rows:
+            ag_id = r.asset_group.id
+            if ag_id not in agg:
+                agg[ag_id] = {
+                    "id": ag_id,
+                    "name": r.asset_group.name,
+                    "impressions": 0,
+                    "clicks": 0,
+                    "cost": 0.0,
+                    "conversions": 0.0,
+                    "conversions_value": 0.0,
+                    "ctr": 0.0,
+                }
+            agg[ag_id]["impressions"] += r.metrics.impressions
+            agg[ag_id]["clicks"] += r.metrics.clicks
+            agg[ag_id]["cost"] += r.metrics.cost_micros / 1_000_000
+            agg[ag_id]["conversions"] += r.metrics.conversions
+            agg[ag_id]["conversions_value"] += r.metrics.conversions_value
+        for ag in agg.values():
+            ag["cost"] = round(ag["cost"], 2)
+            ag["conversions"] = round(ag["conversions"], 2)
+            ag["conversions_value"] = round(ag["conversions_value"], 2)
+            ag["roas"] = round(ag["conversions_value"] / ag["cost"], 2) if ag["cost"] > 0 else None
+        return agg
+
+    current = _fetch_period(date_from, date_to)
+    previous = _fetch_period(prev_from, prev_to)
+
+    out = []
+    for ag_id, curr in current.items():
+        prev = previous.get(ag_id, {})
+        prev_cost = prev.get("cost", 0.0)
+        if prev_cost > 0:
+            wow_pct = round((curr["cost"] - prev_cost) / prev_cost * 100, 1)
+        else:
+            wow_pct = None
+        out.append({**curr, "wow_spend_pct": wow_pct})
+
+    return sorted(out, key=lambda x: -x["cost"])
+
+
+def get_pmax_listing_group_perf(client, customer_id, date_from, date_to):
+    """Returns performance by listing group filter (product_type level)."""
+    try:
+        rows = _search(client, customer_id, f"""
+            SELECT
+              asset_group.name,
+              asset_group_listing_group_filter.case_value.product_type.value,
+              asset_group_listing_group_filter.type,
+              metrics.impressions, metrics.clicks, metrics.cost_micros,
+              metrics.conversions, metrics.conversions_value
+            FROM asset_group_product_group_view
+            WHERE asset_group.status = 'ENABLED'
+              AND campaign.status = 'ENABLED'
+              AND asset_group_listing_group_filter.type = 'UNIT_INCLUDED'
+              AND segments.date BETWEEN '{date_from}' AND '{date_to}'
+        """, "pmax_listing_groups")
+    except Exception:
+        return []
+
+    out = []
+    for r in rows:
+        cost = r.metrics.cost_micros / 1_000_000
+        conv_val = r.metrics.conversions_value
+        out.append({
+            "asset_group": r.asset_group.name,
+            "product_type": r.asset_group_listing_group_filter.case_value.product_type.value or "(All products)",
+            "impressions": r.metrics.impressions,
+            "clicks": r.metrics.clicks,
+            "cost": round(cost, 2),
+            "conversions": round(r.metrics.conversions, 2),
+            "roas": round(conv_val / cost, 2) if cost > 0 else None,
+        })
+    return sorted(out, key=lambda x: -x["cost"])
+
+
+def get_pmax_audience_signals(client, customer_id):
+    """Returns audience signals per asset group, resolved to audience names where possible."""
+    try:
+        signal_rows = _search(client, customer_id, """
+            SELECT
+              asset_group.name,
+              asset_group_signal.audience.audience
+            FROM asset_group_signal
+            WHERE asset_group.status = 'ENABLED'
+              AND campaign.status = 'ENABLED'
+        """, "pmax_audience_signals")
+    except Exception:
+        return {}
+
+    # Collect all audience resource names
+    audience_resource_names = set()
+    raw_signals = defaultdict(list)
+    for r in signal_rows:
+        aud_resource = r.asset_group_signal.audience.audience
+        raw_signals[r.asset_group.name].append(aud_resource)
+        if aud_resource:
+            audience_resource_names.add(aud_resource)
+
+    # Extract numeric IDs from resource names (format: customers/{cid}/audiences/{id})
+    audience_ids = []
+    for res in audience_resource_names:
+        parts = res.split("/")
+        if len(parts) >= 4:
+            try:
+                audience_ids.append(int(parts[-1]))
+            except ValueError:
+                pass
+
+    # Fetch audience names
+    name_map = {}
+    if audience_ids:
+        id_list = ", ".join(str(i) for i in audience_ids)
+        try:
+            aud_rows = _search(client, customer_id, f"""
+                SELECT audience.id, audience.name, audience.description
+                FROM audience
+                WHERE audience.status = 'ENABLED'
+                  AND audience.id IN ({id_list})
+            """, "pmax_audience_names")
+            for r in aud_rows:
+                name_map[r.audience.id] = r.audience.name or str(r.audience.id)
+        except Exception:
+            pass
+
+    # Build output: resolve resource names to audience names
+    out = {}
+    for ag_name, resources in raw_signals.items():
+        resolved = []
+        for res in resources:
+            if not res:
+                continue
+            parts = res.split("/")
+            if len(parts) >= 4:
+                try:
+                    aud_id = int(parts[-1])
+                    resolved.append(name_map.get(aud_id, str(aud_id)))
+                except ValueError:
+                    resolved.append(res)
+            else:
+                resolved.append(res)
+        out[ag_name] = resolved
+
+    return out
+
+
+# ── PMax Intelligence Claude analysis ────────────────────────────────────────
+
+def generate_pmax_intelligence(account_name, asset_performance, ag_metrics, listing_groups, audience_signals):
+    """Call Claude Sonnet to generate a focused PMax intelligence block."""
+    try:
+        import anthropic
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            return "*(Claude API key not configured — skipping PMax intelligence)*"
+
+        sections = []
+
+        # Asset group performance table
+        if ag_metrics:
+            lines = ["ASSET GROUP PERFORMANCE (current period vs prior week):"]
+            for ag in ag_metrics:
+                wow = f"{ag['wow_spend_pct']:+.1f}%" if ag["wow_spend_pct"] is not None else "N/A"
+                roas = f"{ag['roas']:.2f}" if ag["roas"] is not None else "—"
+                lines.append(
+                    f"  {ag['name']} | Spend: £{ag['cost']} | Clicks: {ag['clicks']} | "
+                    f"Conv: {ag['conversions']} | ROAS: {roas} | WoW Spend: {wow}"
+                )
+            sections.append("\n".join(lines))
+
+        # Performance label breakdown
+        if asset_performance:
+            lines = ["ASSET PERFORMANCE LABELS (by asset group and type):"]
+            label_types = {"Headline", "Description", "Long Headline", "Marketing Image", "Square Image"}
+            for grp_name, fields in asset_performance.items():
+                lines.append(f"\n  Asset Group: {grp_name}")
+                for field_name, assets in fields.items():
+                    if field_name not in label_types:
+                        continue
+                    counts = defaultdict(int)
+                    low_assets = []
+                    for a in assets:
+                        counts[a["label"]] += 1
+                        if a["label"] == "LOW" and a["text"]:
+                            low_assets.append(a["text"])
+                    count_str = " | ".join(f"{lbl}: {cnt}" for lbl, cnt in sorted(counts.items()))
+                    lines.append(f"    {field_name}: {count_str}")
+                    if low_assets:
+                        lines.append(f"      LOW assets: {' | '.join(low_assets[:5])}")
+            sections.append("\n".join(lines))
+
+        # Listing groups
+        if listing_groups:
+            lines = ["LISTING GROUP PERFORMANCE (product type level):"]
+            for lg in listing_groups[:15]:
+                roas = f"{lg['roas']:.2f}" if lg["roas"] is not None else "—"
+                lines.append(
+                    f"  [{lg['asset_group']}] {lg['product_type']} | "
+                    f"Spend: £{lg['cost']} | Conv: {lg['conversions']} | ROAS: {roas}"
+                )
+            sections.append("\n".join(lines))
+
+        # Audience signals
+        if audience_signals:
+            lines = ["AUDIENCE SIGNALS (per asset group):"]
+            for ag_name, signals in audience_signals.items():
+                if signals:
+                    lines.append(f"  {ag_name}: {', '.join(signals)}")
+                else:
+                    lines.append(f"  {ag_name}: (no signals configured)")
+            # Flag groups with no signals
+            all_groups = set(ag["name"] for ag in ag_metrics) if ag_metrics else set()
+            groups_with_signals = set(audience_signals.keys())
+            missing = all_groups - groups_with_signals
+            if missing:
+                lines.append(f"  Groups with NO audience signals: {', '.join(missing)}")
+            sections.append("\n".join(lines))
+
+        data_block = "\n\n".join(sections)
+
+        has_listing = bool(listing_groups)
+        has_signals = bool(audience_signals)
+
+        listing_instruction = (
+            "\n### Listing Group Performance\n"
+            "Which product types are generating the best returns? "
+            "Flag any product type with high spend and low/zero ROAS. "
+            "Note if any asset group has no listing group data."
+        ) if has_listing else ""
+
+        signals_instruction = (
+            "\n### Audience Signals Review\n"
+            "Note which asset groups have signals and which don't. "
+            "Flag if signals look thin (e.g., only one signal per group, no customer match, no custom intent). "
+            "Suggest specific audience signals to add where missing."
+        ) if has_signals else (
+            "\n### Audience Signals Review\n"
+            "No audience signals data available. Note this and recommend adding signals."
+        )
+
+        system_prompt = (
+            "You are a senior PPC analyst and PMax specialist. "
+            "You write rigorous, specific analysis — no filler, no generic advice. "
+            "Every recommendation must reference actual asset names, group names, or metrics from the data provided. "
+            "Use markdown with the exact sub-headers specified."
+        )
+
+        user_prompt = (
+            f"Analyse the PMax data below for **{account_name}** and write a focused PMax intelligence section.\n\n"
+            f"---\n\n{data_block}\n\n---\n\n"
+            "Write a PMax analysis using exactly these sub-headers:\n\n"
+            "### Asset Group Scorecard\n"
+            "Rank asset groups by performance. Note any with strong WoW improvement or decline. "
+            "Flag any group with ROAS below 1.0 or zero conversions. "
+            "Identify the best-performing group and explain what's driving it.\n\n"
+            "### Asset Performance Labels — What to Swap\n"
+            "Flag any text asset rated LOW by name and suggest a specific replacement. "
+            "Flag if any asset type has 0 BEST assets. "
+            "Flag if PENDING count is high (>3 per field type — not enough data yet). "
+            "Be specific: quote the LOW asset text and provide a concrete replacement.\n"
+            + listing_instruction
+            + signals_instruction
+            + "\n\n### PMax Optimisation Plan\n"
+            "Numbered list, maximum 6 items, ordered by expected impact. "
+            "Each item must reference a specific asset group, metric, or audience by name. "
+            "Focus on the highest-leverage actions: asset swaps, bid signals, listing group splits, audience additions."
+        )
+
+        ai_client = anthropic.Anthropic(api_key=api_key)
+        msg = ai_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2048,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        return msg.content[0].text.strip()
+
+    except Exception as e:
+        return f"*(PMax intelligence generation failed: {e})*"
+
+
+def get_pmax_intelligence_block(client, customer_id, account_name, date_from, date_to, prev_from, prev_to):
+    """Orchestrates all PMax data fetches and generates a complete markdown block."""
+
+    # 1. Fetch all four data sources
+    asset_performance = get_pmax_asset_performance(client, customer_id)
+    ag_metrics        = get_pmax_asset_group_metrics(client, customer_id, date_from, date_to, prev_from, prev_to)
+    listing_groups    = get_pmax_listing_group_perf(client, customer_id, date_from, date_to)
+    audience_signals  = get_pmax_audience_signals(client, customer_id)
+
+    # 2. Build raw data tables
+    block_lines = [f"## PMax Intelligence", ""]
+
+    # Asset group performance table
+    block_lines += [
+        "### Raw Data — Asset Group Performance",
+        "",
+        "| Asset Group | Spend | Clicks | Conv | ROAS | WoW Spend |",
+        "|---|---|---|---|---|---|",
+    ]
+    for ag in ag_metrics:
+        roas = f"{ag['roas']:.2f}" if ag["roas"] is not None else "—"
+        wow  = f"{ag['wow_spend_pct']:+.1f}%" if ag["wow_spend_pct"] is not None else "—"
+        block_lines.append(
+            f"| {ag['name']} | £{ag['cost']} | {ag['clicks']} | {ag['conversions']} | {roas} | {wow} |"
+        )
+
+    # Asset label summary table
+    block_lines += ["", "### Raw Data — Asset Performance Labels", ""]
+    label_types = {"Headline", "Description", "Long Headline", "Marketing Image", "Square Image"}
+    label_rows = []
+    for grp_name, fields in asset_performance.items():
+        for field_name, assets in fields.items():
+            if field_name not in label_types:
+                continue
+            counts = defaultdict(int)
+            for a in assets:
+                counts[a["label"]] += 1
+            label_rows.append((
+                grp_name, field_name,
+                counts.get("BEST", 0), counts.get("GOOD", 0),
+                counts.get("LOW", 0), counts.get("PENDING", 0),
+            ))
+
+    if label_rows:
+        block_lines += [
+            "| Asset Group | Type | BEST | GOOD | LOW | PENDING |",
+            "|---|---|---|---|---|---|",
+        ]
+        for row in label_rows:
+            block_lines.append(f"| {row[0]} | {row[1]} | {row[2]} | {row[3]} | {row[4]} | {row[5]} |")
+    else:
+        block_lines.append("*No asset label data available.*")
+
+    # Listing group table
+    block_lines += ["", "### Raw Data — Listing Group Performance", ""]
+    if listing_groups:
+        block_lines += [
+            "| Asset Group | Product Type | Spend | Conv | ROAS |",
+            "|---|---|---|---|---|",
+        ]
+        for lg in listing_groups:
+            roas = f"{lg['roas']:.2f}" if lg["roas"] is not None else "—"
+            block_lines.append(
+                f"| {lg['asset_group']} | {lg['product_type']} | £{lg['cost']} | {lg['conversions']} | {roas} |"
+            )
+    else:
+        block_lines.append("*No listing group data available.*")
+
+    # Audience signals table
+    block_lines += ["", "### Raw Data — Audience Signals", ""]
+    if audience_signals:
+        block_lines += [
+            "| Asset Group | Audience Signals |",
+            "|---|---|",
+        ]
+        for ag_name, signals in audience_signals.items():
+            sig_str = ", ".join(signals) if signals else "*(none)*"
+            block_lines.append(f"| {ag_name} | {sig_str} |")
+    else:
+        block_lines.append("*No audience signal data available.*")
+
+    block_lines += ["", "---", ""]
+
+    # 3. Generate Claude analysis
+    claude_analysis = generate_pmax_intelligence(
+        account_name, asset_performance, ag_metrics, listing_groups, audience_signals
+    )
+    block_lines.append(claude_analysis)
+
+    return "\n".join(block_lines)
 
 
 def get_device_breakdown(client, customer_id, date_from, date_to):

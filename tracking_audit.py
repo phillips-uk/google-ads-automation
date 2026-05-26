@@ -18,7 +18,7 @@ First run will open a browser to authorise GTM API access. Token saved to gtm_to
 
 import os
 import json
-from datetime import date
+from datetime import date, timedelta
 from collections import defaultdict
 
 import yaml
@@ -93,67 +93,42 @@ ATTRIBUTION_LABELS = {
 }
 
 
-# ── GTM Authentication ────────────────────────────────────────────────────────
+# ── GTM Authentication — OAuth (installed-app flow) ───────────────────────────
+# GTM uses the cached OAuth token in gtm_token.json.
+# The service account cannot be granted GTM manage.users without a fresh OAuth
+# flow that includes tagmanager.manage.users scope — which the existing token
+# was not authorised with. OAuth token does not expire if used regularly.
 
 def _gtm_credentials():
-    """Load or refresh GTM OAuth credentials. Opens browser on first run."""
-    # Load saved token
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE) as f:
-            td = json.load(f)
-        creds = Credentials(
-            token=td.get("token"),
-            refresh_token=td.get("refresh_token"),
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=td.get("client_id"),
-            client_secret=td.get("client_secret"),
-            scopes=GTM_SCOPES,
-        )
-        if creds.valid:
-            return creds
-        if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            _save_token(creds)
-            return creds
+    """OAuth credentials for GTM API. Auto-refreshes from gtm_token.json.
 
-    # First run — browser OAuth using Desktop app client
+    First run opens a browser. Subsequent runs use the cached refresh token.
+    """
+    import json as _json
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+
     with open(GTM_CLIENT_FILE) as f:
-        gc = json.load(f)
+        client_data = _json.load(f)
+    creds_data = client_data.get("installed") or client_data.get("web") or client_data
 
-    # gtm_client.json may be {"installed": {...}} or flat {"client_id": ...}
-    installed = gc.get("installed", gc)
+    with open(TOKEN_FILE) as f:
+        token_data = _json.load(f)
 
-    client_config = {
-        "installed": {
-            "client_id":     installed["client_id"],
-            "client_secret": installed["client_secret"],
-            "redirect_uris": installed.get("redirect_uris", ["http://localhost"]),
-            "auth_uri":      installed.get("auth_uri", "https://accounts.google.com/o/oauth2/auth"),
-            "token_uri":     installed.get("token_uri", "https://oauth2.googleapis.com/token"),
-        }
-    }
-
-    print("\n" + "=" * 70)
-    print("  GTM API authorisation required (one-time setup).")
-    print("  A browser window will open — log in and click Allow.")
-    print("  The script continues automatically once approved.")
-    print("=" * 70 + "\n")
-
-    flow  = InstalledAppFlow.from_client_config(client_config, GTM_SCOPES)
-    creds = flow.run_local_server(port=0, open_browser=True)
-    _save_token(creds)
-    print("  GTM auth approved. Token saved — will not prompt again.\n")
+    creds = Credentials(
+        token=token_data.get("token"),
+        refresh_token=token_data.get("refresh_token"),
+        client_id=creds_data.get("client_id"),
+        client_secret=creds_data.get("client_secret"),
+        token_uri="https://oauth2.googleapis.com/token",
+    )
+    if not creds.valid:
+        creds.refresh(Request())
+        # Persist refreshed token
+        token_data["token"] = creds.token
+        with open(TOKEN_FILE, "w") as f:
+            _json.dump(token_data, f, indent=2)
     return creds
-
-
-def _save_token(creds):
-    with open(TOKEN_FILE, "w") as f:
-        json.dump({
-            "token":         creds.token,
-            "refresh_token": creds.refresh_token,
-            "client_id":     creds.client_id,
-            "client_secret": creds.client_secret,
-        }, f)
 
 
 def build_gtm_service():
@@ -232,6 +207,134 @@ def get_variables(service, workspace_path):
         return []
 
 
+# ── GA4 / Spend Tracking Continuity Check ─────────────────────────────────────
+
+def fetch_daily_ga4_sessions(property_id: str, days: int = 14) -> dict:
+    """
+    Returns {date_str: session_count} for the past N days using the GA4 Data API.
+    Uses GA4DataClient which tries SA first then falls back to OAuth on 403.
+    Returns an empty dict on any error (non-fatal — continuity check is best-effort).
+    """
+    try:
+        from ga4_data import GA4DataClient
+        from google.analytics.data_v1beta.types import (
+            RunReportRequest, Dimension, Metric, DateRange,
+        )
+        end   = date.today() - timedelta(days=1)
+        start = end - timedelta(days=days - 1)
+        ga4 = GA4DataClient(property_id)
+        resp = ga4._run(RunReportRequest(
+            property=ga4.property,
+            date_ranges=[DateRange(start_date=start.isoformat(), end_date=end.isoformat())],
+            dimensions=[Dimension(name="date")],
+            metrics=[Metric(name="sessions")],
+        ))
+        return {row.dimension_values[0].value: int(row.metric_values[0].value) for row in resp.rows}
+    except Exception as e:
+        print(f"    [WARN] GA4 daily sessions fetch failed: {e}")
+        return {}
+
+
+def fetch_daily_ads_spend(ads_client, customer_id: str, days: int = 14) -> dict:
+    """
+    Returns {date_str: spend_gbp} summed across all campaigns for the past N days.
+    """
+    end   = date.today() - timedelta(days=1)
+    start = end - timedelta(days=days - 1)
+    ga_service = ads_client.get_service("GoogleAdsService")
+    query = f"""
+        SELECT segments.date, metrics.cost_micros
+        FROM campaign
+        WHERE segments.date BETWEEN '{start.isoformat()}' AND '{end.isoformat()}'
+          AND campaign.status = 'ENABLED'
+    """
+    daily: dict = {}
+    try:
+        for row in ga_service.search(customer_id=customer_id, query=query):
+            d = row.segments.date
+            daily[d] = daily.get(d, 0.0) + row.metrics.cost_micros / 1_000_000
+    except Exception as e:
+        print(f"    [WARN] Google Ads daily spend fetch failed: {e}")
+    return {d: round(v, 2) for d, v in daily.items()}
+
+
+def check_tracking_continuity(property_id: str, ads_client, customer_id: str, days: int = 14) -> list:
+    """
+    Cross-references GA4 daily sessions against Google Ads daily spend.
+    Flags any day where:
+      spend > £50  AND  GA4 sessions == 0  →  CRITICAL  (total blackout)
+      spend > £50  AND  GA4 sessions < 10  →  HIGH      (near-blackout)
+    Returns a list of issue dicts compatible with findings["issues"].
+    """
+    ga4_sessions = fetch_daily_ga4_sessions(property_id, days)
+    ads_spend    = fetch_daily_ads_spend(ads_client, customer_id, days)
+
+    if not ads_spend:
+        return []
+
+    issues = []
+    for day, spend in sorted(ads_spend.items()):
+        if spend < 50:
+            continue
+        sessions = ga4_sessions.get(day, 0)
+        if sessions == 0:
+            issues.append({
+                "severity": "CRITICAL",
+                "msg": (
+                    f"Tracking blackout {day}: £{spend:.2f} GAds spend, 0 GA4 sessions. "
+                    "Server-side app disconnected or GTM not firing. "
+                    "Check Shopify → Google & YouTube → Connected services → Google Analytics tab."
+                ),
+            })
+        elif sessions < 10:
+            issues.append({
+                "severity": "HIGH",
+                "msg": (
+                    f"Near-blackout {day}: £{spend:.2f} GAds spend, only {sessions} GA4 session(s). "
+                    "Possible partial tracking failure — verify app connection."
+                ),
+            })
+    return issues
+
+
+def fetch_ga4_channel_breakdown(property_id: str, days: int = 30) -> dict:
+    """
+    Pull GA4 session channel breakdown for the last N days.
+    Returns {channel: {sessions, pct}} ordered by session count desc.
+    Uses GA4DataClient (SA primary, OAuth fallback).
+    Returns {} on any error (non-fatal).
+    """
+    try:
+        from ga4_data import GA4DataClient
+        from google.analytics.data_v1beta.types import (
+            RunReportRequest, Dimension, Metric, DateRange, OrderBy,
+        )
+        end   = date.today() - timedelta(days=1)
+        start = end - timedelta(days=days - 1)
+        ga4 = GA4DataClient(property_id)
+        resp = ga4._run(RunReportRequest(
+            property=ga4.property,
+            date_ranges=[DateRange(start_date=start.isoformat(), end_date=end.isoformat())],
+            dimensions=[Dimension(name="sessionDefaultChannelGroup")],
+            metrics=[Metric(name="sessions")],
+            order_bys=[OrderBy(
+                metric=OrderBy.MetricOrderBy(metric_name="sessions"),
+                desc=True,
+            )],
+        ))
+        total = sum(int(r.metric_values[0].value) for r in resp.rows) or 1
+        return {
+            r.dimension_values[0].value: {
+                "sessions": int(r.metric_values[0].value),
+                "pct":      round(int(r.metric_values[0].value) / total * 100, 1),
+            }
+            for r in resp.rows
+        }
+    except Exception as e:
+        print(f"    [WARN] GA4 channel breakdown fetch failed: {e}")
+        return {}
+
+
 # ── Google Ads Conversion Fetcher ─────────────────────────────────────────────
 
 def get_conversion_actions(ads_client, customer_id):
@@ -294,6 +397,22 @@ def _param(tag, key):
     return ""
 
 
+def _event_params(tag):
+    """
+    Extract event parameters from a gaawe (GA4 Event) tag as {param_name: value_ref}.
+    Event parameters are stored as a list of maps under key 'eventParameters'.
+    """
+    result = {}
+    for p in tag.get("parameter", []):
+        if p.get("key") == "eventParameters" and p.get("type") == "list":
+            for list_item in p.get("list", []):
+                if list_item.get("type") == "map":
+                    m = {x.get("key", ""): x.get("value", "") for x in list_item.get("map", [])}
+                    if "key" in m and "value" in m:
+                        result[m["key"]] = m["value"]
+    return result
+
+
 def analyse_container(tags, triggers, variables, conversion_actions):
     """
     Return a structured findings dict covering:
@@ -305,17 +424,21 @@ def analyse_container(tags, triggers, variables, conversion_actions):
       - issues list
     """
     findings = {
-        "tag_inventory":     defaultdict(list),
-        "ads_tags":          [],
-        "ga4_tags":          [],
-        "consent_tags":      [],
-        "cmp_detected":      False,
-        "consent_mode_v2":   False,
-        "ec_detected":       False,
-        "issues":            [],
-        "trigger_map":       {},   # triggerId → trigger name
-        "variable_names":    [],
-        "orphaned_tags":     [],   # tags with no firing trigger
+        "tag_inventory":       defaultdict(list),
+        "ads_tags":            [],
+        "ga4_tags":            [],
+        "consent_tags":        [],
+        "cmp_detected":        False,
+        "consent_mode_v2":     False,
+        "ec_detected":         False,
+        "issues":              [],
+        "trigger_map":         {},   # triggerId → trigger name
+        "variable_names":      [],
+        "orphaned_tags":       [],   # tags with no firing trigger
+        # ── New checks ────────────────────────────────────────────────────────
+        "purchase_ga4_tags":   [],   # [{name, has_items, items_var}]
+        "consent_inside_gtm":  False,
+        "channel_breakdown":   {},   # filled in main() via GA4 Data API
     }
 
     # Build trigger lookup
@@ -382,6 +505,14 @@ def analyse_container(tags, triggers, variables, conversion_actions):
         elif tag_type in ("gaawe", "gaawc", "ua"):
             event_name = _param(tag, "eventName") or _param(tag, "trackType") or "config"
             findings["ga4_tags"].append({**entry, "event_name": event_name})
+            # Track purchase event tags for Cart Data check
+            if tag_type == "gaawe" and event_name.lower() == "purchase" and not paused:
+                ep = _event_params(tag)
+                findings["purchase_ga4_tags"].append({
+                    "name":      tag_name,
+                    "has_items": "items" in ep,
+                    "items_var": ep.get("items", ""),
+                })
 
         # ── Custom HTML — scan for consent / EC signals ───────────────────────
         elif tag_type == "html":
@@ -483,19 +614,103 @@ def analyse_container(tags, triggers, variables, conversion_actions):
         })
 
     # Conversion action settings checks
-    for ca in conversion_actions:
-        if not ca["in_conversions"]:
+    # Nuance: secondary (in_conversions=False) is intentional when the account has ≥1 enabled
+    # primary action. Only flag as MEDIUM if there are NO primary actions at all — meaning
+    # Smart Bidding has no optimisation target. Secondary-only setups (e.g. observed purchase
+    # alongside a primary lead conversion, or Android app set to secondary) are INFO only.
+    enabled_cas = [c for c in conversion_actions if c.get("status") == "ENABLED"]
+    primary_cas  = [c for c in enabled_cas if c["in_conversions"]]
+    secondary_cas = [c for c in enabled_cas if not c["in_conversions"]]
+
+    for ca in secondary_cas:
+        if primary_cas:
+            # Intentional secondary — observed only alongside a proper primary signal
+            issues.append({
+                "severity": "INFO",
+                "msg": f"'{ca['name']}' is secondary (observed only, not in Smart Bidding). "
+                       f"Intentional if this is a supplementary signal. "
+                       f"Primary: {', '.join(p['name'] for p in primary_cas[:2])}.",
+            })
+        else:
+            # No primary conversion action — Smart Bidding has nothing to optimise toward
             issues.append({
                 "severity": "MEDIUM",
-                "msg": f"Conversion action '{ca['name']}' is excluded from 'Conversions' — "
-                       "won't influence Smart Bidding.",
+                "msg": f"'{ca['name']}' is excluded from Smart Bidding and no primary "
+                       "conversion actions are enabled. Smart Bidding has no optimisation target.",
             })
+
+    for ca in conversion_actions:
         if ca["attribution"] == "LAST_CLICK" and ca["primary"]:
             issues.append({
                 "severity": "LOW",
                 "msg": f"'{ca['name']}' uses Last Click attribution. Consider Data-Driven "
                        "if you have sufficient conversion volume (50+/month).",
             })
+
+    # ── Cart Data: GA4 purchase event items parameter ─────────────────────────
+    # Build variable DataLayer path index for the id-field check
+    var_dl_paths = {}
+    for v in variables:
+        if v.get("type") == "v":
+            for p in v.get("parameter", []):
+                if p.get("key") == "name":
+                    var_dl_paths[v.get("name", "")] = p.get("value", "")
+
+    for pt in findings["purchase_ga4_tags"]:
+        if not pt["has_items"]:
+            issues.append({
+                "severity": "MEDIUM",
+                "msg": (
+                    f"GA4 purchase tag '{pt['name']}' has no 'items' event parameter. "
+                    "Product-level data is missing from GA4 ecommerce reports and "
+                    "Google Ads Cart Data will not work."
+                ),
+            })
+        else:
+            # Check if any variable specifically maps an .id path from the items array
+            # (e.g. ecommerce.items[0].id) — evidence that id is extracted intentionally
+            has_items_id_var = any(
+                ".id" in path.lower() and "ecommerce" in path.lower()
+                for path in var_dl_paths.values()
+            )
+            if not has_items_id_var:
+                issues.append({
+                    "severity": "LOW",
+                    "msg": (
+                        f"Cart Data: '{pt['name']}' sends items via '{pt['items_var']}'. "
+                        "Verify the dataLayer push includes 'id' (Google Shopping feed format) "
+                        "alongside 'item_id' in each item object. Without 'id', Google Ads "
+                        "Conversions with Cart Data cannot match items to the product feed."
+                    ),
+                })
+
+    # ── Consent timing: flag if consent default fires inside GTM ─────────────
+    # The consent default must be pushed to the dataLayer BEFORE the GTM snippet
+    # loads. If it fires inside GTM via a consentInit tag, it is already too late —
+    # GTM's first beacon (gtm.js) is sent without consent context.
+    consent_init_tids = {t["triggerId"] for t in triggers if t.get("type") == "consentInit"}
+    if consent_init_tids:
+        for tag in tags:
+            if tag.get("type") != "html":
+                continue
+            html_content = _param(tag, "html")
+            firing_ids   = set(tag.get("firingTriggerId", []))
+            if (firing_ids & consent_init_tids
+                    and ("gtag('consent'" in html_content or 'gtag("consent"' in html_content)
+                    and "default" in html_content):
+                findings["consent_inside_gtm"] = True
+                issues.append({
+                    "severity": "MEDIUM",
+                    "msg": (
+                        f"Consent Mode v2 default fires inside GTM via '{tag.get('name', 'tag')}' "
+                        "(consentInit trigger). The container has already loaded before this fires — "
+                        "the initial gtm.js hit carries no consent context, causing pre-consent "
+                        "sessions to appear as Unassigned in GA4. "
+                        "Fix: push the consent default in the CMP script or page source "
+                        "before the GTM snippet, not inside a GTM tag."
+                    ),
+                })
+                break
 
     return findings
 
@@ -532,6 +747,15 @@ def generate_recommendations(account_name, findings, conversion_actions, contain
             for ca in conversion_actions
         )
 
+        # Build channel breakdown context
+        channel_text = ""
+        if findings.get("channel_breakdown"):
+            lines_ch = []
+            for ch, data in list(findings["channel_breakdown"].items())[:12]:
+                flag = " ⚠️" if ch == "Unassigned" and data["pct"] >= 5 else ""
+                lines_ch.append(f"  {ch}{flag}: {data['sessions']:,} sessions ({data['pct']:.1f}%)")
+            channel_text = "GA4 CHANNEL BREAKDOWN (last 30 days):\n" + "\n".join(lines_ch) + "\n\n"
+
         prompt = (
             f"You are a senior Google Ads tracking specialist auditing **{account_name}**.\n\n"
             f"GTM Container: {container_info.get('publicId')} | "
@@ -542,8 +766,10 @@ def generate_recommendations(account_name, findings, conversion_actions, contain
             f"GOOGLE ADS TAGS IN GTM:\n{ads_tags_text or '  None found.'}\n\n"
             f"GA4 TAGS IN GTM:\n{ga4_text or '  None found.'}\n\n"
             f"CONSENT MODE v2 DETECTED: {findings['consent_mode_v2']}\n"
+            f"CONSENT DEFAULT FIRES INSIDE GTM: {findings.get('consent_inside_gtm', False)}\n"
             f"ENHANCED CONVERSIONS DETECTED: {findings['ec_detected']}\n"
             f"CMP DETECTED: {findings['cmp_detected']}\n\n"
+            f"{channel_text}"
             f"GOOGLE ADS CONVERSION ACTIONS:\n{conv_text or '  None.'}\n\n"
             "Write a structured implementation plan using these exact sections:\n\n"
             "## Critical Fixes (do these first)\n"
@@ -596,6 +822,35 @@ def write_audit_report(account_name, findings, conversion_actions, recommendatio
     has_high     = any(i["severity"] == "HIGH"     for i in findings["issues"])
     overall      = "🔴 Critical Issues" if has_critical else ("🟠 Action Required" if has_high else "✅ Healthy")
 
+    # ── Derived status values for new checks ─────────────────────────────────
+    # Cart Data
+    purchase_tags = findings.get("purchase_ga4_tags", [])
+    if not purchase_tags:
+        cart_data_status = "— no purchase tag"
+    elif all(pt["has_items"] for pt in purchase_tags):
+        cart_data_status = "✅ items parameter present"
+    else:
+        cart_data_status = "❌ items parameter missing"
+
+    # Consent timing
+    consent_timing_status = (
+        "⚠️ Fires inside GTM (too late)" if findings.get("consent_inside_gtm")
+        else "✅ OK / outside GTM"
+    )
+
+    # Channel breakdown
+    channel_breakdown = findings.get("channel_breakdown", {})
+    if not channel_breakdown:
+        channel_status = "— GA4 Data API not configured"
+    else:
+        unassigned_pct = channel_breakdown.get("Unassigned", {}).get("pct", 0)
+        if unassigned_pct >= 15:
+            channel_status = f"🔴 {unassigned_pct:.1f}% Unassigned"
+        elif unassigned_pct >= 5:
+            channel_status = f"🟠 {unassigned_pct:.1f}% Unassigned"
+        else:
+            channel_status = f"✅ {unassigned_pct:.1f}% Unassigned"
+
     lines = [
         "---",
         f"tags: [google-ads, tracking-audit, {account_name.lower().replace(' ', '-')}]",
@@ -617,9 +872,17 @@ def write_audit_report(account_name, findings, conversion_actions, recommendatio
         f"| Active conversion tag | {'✅ Yes' if any(not t['paused'] for t in findings['ads_tags']) else '❌ All paused'} |",
         f"| Enhanced Conversions | {'✅ Detected' if findings['ec_detected'] else '❌ Not configured'} |",
         f"| Consent Mode v2 | {'✅ Detected' if findings['consent_mode_v2'] else '❌ Not configured'} |",
+        f"| Consent timing | {consent_timing_status} |",
         f"| CMP present | {'✅ Detected' if findings['cmp_detected'] else '❌ Not found'} |",
         "| GA4 purchase event | " + ("✅ Found" if any(t.get("event_name","").lower() == "purchase" for t in findings["ga4_tags"]) else "⚠️ Not found") + " |",
+        f"| Cart Data (items parameter) | {cart_data_status} |",
         f"| Orphaned tags | {'⚠️ ' + str(len(findings['orphaned_tags'])) + ' tag(s)' if findings['orphaned_tags'] else '✅ None'} |",
+        "| GA4/spend continuity (14d) | " + (
+            "🔴 " + str(sum(1 for i in findings["issues"] if i["severity"] == "CRITICAL" and "blackout" in i["msg"])) + " blackout day(s)"
+            if any("blackout" in i["msg"] for i in findings["issues"])
+            else "✅ No blackout days"
+        ) + " |",
+        f"| GA4 % Unassigned (30d) | {channel_status} |",
         "",
         "---",
         "",
@@ -633,6 +896,18 @@ def write_audit_report(account_name, findings, conversion_actions, recommendatio
             lines.append("")
     else:
         lines += ["*No issues detected.*", ""]
+
+    # ── GA4 Channel Breakdown table
+    if findings.get("channel_breakdown"):
+        lines += ["---", "", "## GA4 Channel Breakdown (Last 30 Days)", ""]
+        lines += [
+            "| Channel | Sessions | % |",
+            "| --- | --- | --- |",
+        ]
+        for channel, data in findings["channel_breakdown"].items():
+            flag = " ⚠️" if channel == "Unassigned" and data["pct"] >= 5 else ""
+            lines.append(f"| {channel}{flag} | {data['sessions']:,} | {data['pct']:.1f}% |")
+        lines += [""]
 
     lines += ["---", "", "## GTM Container", ""]
     lines.append(
@@ -763,9 +1038,58 @@ def main():
         conversion_actions = get_conversion_actions(ads_client, cfg["ads_customer_id"])
         print(f"    Conversion actions: {len(conversion_actions)}")
 
+        # ── GA4 / spend continuity check ──────────────────────────────────────
+        ga4_prop = cfg.get("ga4_property_id")
+        if ga4_prop:
+            print("    Checking GA4/spend continuity (14-day)...")
+            continuity_issues = check_tracking_continuity(ga4_prop, ads_client, cfg["ads_customer_id"])
+            if continuity_issues:
+                print(f"    ⚠️  {len(continuity_issues)} tracking continuity issue(s) found.")
+            else:
+                print("    GA4/spend continuity: OK — no blackout days in last 14 days.")
+        else:
+            continuity_issues = []
+
         # ── Analyse ───────────────────────────────────────────────────────────
         print("    Analysing...")
         findings = analyse_container(tags, triggers, variables, conversion_actions)
+        findings["issues"].extend(continuity_issues)  # merge continuity issues in
+
+        # ── GA4 channel breakdown (30-day % Unassigned check) ─────────────────
+        if ga4_prop:
+            print("    Checking GA4 channel attribution (30-day)...")
+            channel_breakdown = fetch_ga4_channel_breakdown(ga4_prop)
+            findings["channel_breakdown"] = channel_breakdown
+            if channel_breakdown:
+                unassigned_pct = channel_breakdown.get("Unassigned", {}).get("pct", 0)
+                total_sessions = sum(v["sessions"] for v in channel_breakdown.values())
+                print(f"    Channel breakdown: {total_sessions:,} sessions, "
+                      f"{unassigned_pct:.1f}% Unassigned")
+                if unassigned_pct >= 15:
+                    consent_note = (
+                        " Likely linked to Consent Mode default firing inside GTM."
+                        if findings.get("consent_inside_gtm") else ""
+                    )
+                    findings["issues"].append({
+                        "severity": "HIGH",
+                        "msg": (
+                            f"GA4 channel attribution: {unassigned_pct:.1f}% Unassigned "
+                            f"in last 30 days (threshold: 15%). Sessions are reaching GA4 "
+                            f"without source attribution — campaign optimisation is partially "
+                            f"blind.{consent_note}"
+                        ),
+                    })
+                elif unassigned_pct >= 5:
+                    findings["issues"].append({
+                        "severity": "MEDIUM",
+                        "msg": (
+                            f"GA4 channel attribution: {unassigned_pct:.1f}% Unassigned "
+                            "in last 30 days. Check consent timing, UTM parameter coverage, "
+                            "and referral exclusions."
+                        ),
+                    })
+            else:
+                print("    Channel breakdown: skipped (GA4 Data API not yet configured for this property)")
         print(f"    Issues found: {len(findings['issues'])}")
         for issue in findings["issues"]:
             icon = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵"}.get(issue["severity"], "")
@@ -787,7 +1111,7 @@ def main():
         # ── Post to Monday.com ────────────────────────────────────────────────
         if findings["issues"]:
             print("    Posting action items to Monday.com...")
-            post_audit_issues(account_name, findings["issues"])
+            post_audit_issues(account_name, findings["issues"], report_path=str(report_path))
 
     print("\n" + "=" * 70)
     print("Audit complete.")
